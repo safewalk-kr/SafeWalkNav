@@ -46,8 +46,13 @@ class TrafficLightAnalyzer(
         }
         lastFrameAt.set(now)
 
+        // 프레임 비트맵(1280×720 ARGB ≈ 3.7MB 네이티브)은 detect() 가 끝나면 아무도 안 쓴다.
+        // detect() 는 참조를 남기지 않고(픽셀은 입력 버퍼로 복사 끝), 콜백에는 검출 리스트만 간다.
+        // GC 를 기다리면 3fps 에서 비트맵만 초당 ~27MB 가 쌓이므로 finally 에서 바로 반납한다.
+        var frame: Bitmap? = null
         try {
             val bitmap = imageProxyToBitmap(image)
+            frame = bitmap
             val detections = detector.detect(bitmap)
             consecutiveFailures = 0
             onDetection(detections)
@@ -68,6 +73,7 @@ class TrafficLightAnalyzer(
                 onFailure(consecutiveFailures)
             }
         } finally {
+            frame?.recycle()
             image.close()
         }
     }
@@ -76,11 +82,23 @@ class TrafficLightAnalyzer(
      * ImageProxy → Bitmap 변환.
      * `image.toBitmap()` 은 camera-core 1.3.0+ 에서 제공 (우리 의존성 1.3.1).
      * 카메라 회전 (rotationDegrees) 을 보정해서 똑바로 세움.
+     *
+     * 반환 비트맵은 **호출자 소유** (toBitmap 은 매번 새 비트맵을 만들고 ImageProxy 는 참조를 안 남긴다).
      */
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
         val raw = image.toBitmap()
         val degrees = image.imageInfo.rotationDegrees
-        return if (degrees == 0) raw else rotate(raw, degrees.toFloat())
+        if (degrees == 0) return raw
+        val rotated = try {
+            rotate(raw, degrees.toFloat())
+        } catch (t: Throwable) {
+            raw.recycle()   // 회전 중 OOM 이면 원본(3.7MB)이라도 즉시 돌려줘야 다음 프레임이 산다
+            throw t
+        }
+        // 회전본에 픽셀이 다 복사됐으니 원본은 끝. 단 createBitmap 은 결과가 원본과 같으면
+        // 원본 객체를 그대로 돌려줄 수 있다 — 그때 recycle 하면 반환값까지 죽으므로 같은 객체면 둔다.
+        if (rotated !== raw) raw.recycle()
+        return rotated
     }
 
     private fun rotate(bitmap: Bitmap, degrees: Float): Bitmap {

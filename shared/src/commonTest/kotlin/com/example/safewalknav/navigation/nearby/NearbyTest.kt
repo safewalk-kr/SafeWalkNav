@@ -333,7 +333,29 @@ class NearbyTest {
         val stale = NearbyPhrases.placeDetail(p, null, NearbyPhrases.NoDirectionReason.STALE_LOCATION)
         assertFalse(stale.contains("시 방향"))
         assertFalse(stale.contains("8미터"))
-        assertTrue(stale.contains("다시 찾기"))
+        assertTrue(stale.contains("다시 찾기 버튼을 눌러 주세요"), stale)
+    }
+
+    @Test
+    fun 실패문구는_누를_버튼과_도움청하기를_알려줌() {
+        // "다시 시도해 주세요"로 끝내지 않는다 — 보이는 버튼 이름 그대로 부른다.
+        val failures = listOf(
+            NearbyPhrases.SEARCH_FAILED,
+            NearbyPhrases.LOCATION_FAILED,
+            NearbyPhrases.LOCATION_OFF,
+            NearbyPhrases.STALE_LOCATION_HINT,
+        )
+        for (s in failures) {
+            assertTrue(s.contains("다시 찾기 버튼을 눌러 주세요"), s)
+            assertFalse(s.contains("다시 시도"), s)
+            // 두 플랫폼이 같이 쓰는 문구 — 안드로이드 화면 배치 말은 넣지 않는다.
+            assertFalse(s.contains("맨 아래") || s.contains("왼쪽"), s)
+        }
+        // 혼자 못 고치는 원인이면 누구에게 무엇을 부탁할지까지
+        assertTrue(NearbyPhrases.SEARCH_FAILED.contains("주변 분께"))
+        assertTrue(NearbyPhrases.LOCATION_OFF.contains("주변 분께"))
+        // 진동이 화면을 떠나며 멈췄을 때 — 다시 켜는 법까지
+        assertTrue(NearbyPhrases.BEACON_INTERRUPTED.contains("장소를 다시 누르세요"))
     }
 
     @Test

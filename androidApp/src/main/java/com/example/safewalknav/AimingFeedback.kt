@@ -66,9 +66,9 @@ class AimingFeedback(
     private val vibrator: Vibrator,
     /**
      * 접근성 용도 오디오 속성. **반드시 붙여야 한다** —
-     * 속성 없이 vibrate() 하면 USAGE_UNKNOWN 으로 취급돼 절전 모드와 시스템 진동 설정에서
-     * 통째로 억제된다. 음성이 안 들리는 상황에서는 이게 유일한 채널이라, 사용자가 다른 이유로
-     * 켜 둔 절전 모드 하나에 조준 안내가 전부 사라지면 안 된다.
+     * 속성 없이 vibrate() 하면 USAGE_UNKNOWN 으로 취급돼 시스템 진동 설정에서 통째로 억제된다.
+     * ⚠️ 절전 모드는 접근성 용도도 면제하지 않는다(켜진 접근성 서비스가 없으면 꺼질 수 있음) —
+     * 그 사실은 MainActivity 가 말로 알린다.
      */
     private val attrs: AudioAttributes,
 ) {
@@ -107,6 +107,9 @@ class AimingFeedback(
 
     /** 이 시각까지는 아무것도 걸지 않는다 — 안전 진동 보호 구간. */
     private var holdOffUntilMs = 0L
+
+    /** 마지막으로 반복 파형을 건 시각 — 다른 앱 진동에 끊겼을 때 다시 걸기 위한 기준. */
+    private var armedAtMs = 0L
 
     /** 마지막으로 "찾았다"를 울린 시각. 검출이 깜빡일 때 연타되는 걸 막는 쿨다운용. */
     private var lastAcquiredAtMs = 0L
@@ -186,7 +189,14 @@ class AimingFeedback(
         }
         if (sonarExhausted) return
 
-        if (tier == currentTier) return   // 같은 구간이면 파형 유지 — 재설정하면 끊긴다
+        if (tier == currentTier) {
+            // 같은 구간이면 파형 유지 — 재설정하면 끊긴다.
+            // 다만 다른 앱의 진동(카톡 알림·벨)이 우리 반복 파형을 끊으면 다시 걸리지 않는다(안드로이드 14 이상은
+            // 알림 진동이 우선이고, 끝나도 우리 것이 돌아오지 않는다). 잘 겨눈 채로 진동이 사라지면 사용자는
+            // 놓쳤다고 오해한다 — 몇 초마다 같은 파형을 다시 건다. 박자 한 번이 살짝 어긋날 뿐이다.
+            if (tier != Tier.NONE && !armFailed && now - armedAtMs >= REARM_INTERVAL_MS) arm(tier.gapMs)
+            return
+        }
         currentTier = tier
         if (tier == Tier.NONE) cancel() else if (!armFailed) arm(tier.gapMs)
     }
@@ -269,6 +279,7 @@ class AimingFeedback(
         // armed 가 false 로 남으면 stop() 이 조기 반환해 그 무한 파형을 아무도 못 끈다.
         // 거짓 양성(실제로는 안 걸렸는데 armed=true)의 대가는 불필요한 cancel() 한 번뿐이다.
         armed = true
+        armedAtMs = SystemClock.elapsedRealtime()
         try {
             vibrator.vibrate(effect, attrs)
         } catch (_: Exception) {
@@ -333,5 +344,8 @@ class AimingFeedback(
          * 대상이 한 번 사라져야 다시 걸린다.
          */
         private const val SONAR_MAX_MS = 25_000L
+
+        /** 같은 구간의 반복 파형을 다시 거는 주기 — 외부 진동에 끊겨도 이 안에 돌아온다. */
+        private const val REARM_INTERVAL_MS = 3_000L
     }
 }

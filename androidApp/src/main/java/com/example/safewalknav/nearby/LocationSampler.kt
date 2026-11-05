@@ -12,7 +12,10 @@ import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationSettingsRequest
+import com.google.android.gms.location.LocationSettingsResponse
 import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.Task
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -38,6 +41,30 @@ class LocationSampler(context: Context) {
         val lm = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return false
         return LocationManagerCompat.isLocationEnabled(lm)
     }
+
+    /**
+     * 위치 기능을 켜는 시스템 창(Google 위치 설정 창)을 띄울 수 있는지 묻는다.
+     * 실패가 [com.google.android.gms.common.api.ResolvableApiException] 이면 그 `resolution` 으로 창을 띄워
+     * 한 번 눌러 켤 수 있다 — 빠른 설정의 위치 아이콘을 화면을 보지 않고 찾기는 어렵다.
+     * 그 밖의 실패(Play 서비스 없음 등)는 창을 띄울 수 없다는 뜻이다.
+     *
+     * [sample] 이 실제로 쓰는 것과 같은 고정밀 요청으로 묻는다 — "그 요청이 채워지는가"가 기준이다.
+     */
+    fun checkLocationSettings(): Task<LocationSettingsResponse> =
+        LocationServices.getSettingsClient(appContext).checkLocationSettings(
+            LocationSettingsRequest.Builder()
+                .addLocationRequest(highAccuracyRequest())
+                // 이 화면은 위치 없이는 할 수 있는 일이 없다 — "꼭 필요함"으로 알려 창이 매번 뜨게 한다.
+                // (안내의 "두 버튼 중 오른쪽"은 이 설정의 창 기준이다. 실기에서 버튼 수·순서를 확인할 것)
+                .setAlwaysShow(true)
+                .build()
+        )
+
+    private fun highAccuracyRequest(): LocationRequest =
+        LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, INTERVAL_MS)
+            .setMinUpdateIntervalMillis(MIN_INTERVAL_MS)
+            .setWaitForAccurateLocation(false)
+            .build()
 
     /**
      * @param maxDurationMs 최대 대기 시간. 조기 종료 조건을 못 채우면 이때까지 모은 걸 돌려준다.
@@ -70,13 +97,8 @@ class LocationSampler(context: Context) {
             }
         }
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, INTERVAL_MS)
-            .setMinUpdateIntervalMillis(MIN_INTERVAL_MS)
-            .setWaitForAccurateLocation(false)
-            .build()
-
         try {
-            client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+            client.requestLocationUpdates(highAccuracyRequest(), callback, Looper.getMainLooper())
             withTimeoutOrNull(maxDurationMs) { enough.await() }
         } finally {
             client.removeLocationUpdates(callback)

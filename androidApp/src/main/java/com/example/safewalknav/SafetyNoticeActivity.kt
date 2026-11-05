@@ -83,7 +83,17 @@ class SafetyNoticeActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnDecline).setOnClickListener { showBlocked() }
         findViewById<Button>(R.id.btnReconsider).setOnClickListener { showNotice() }
 
-        showNotice()
+        // 설정 변경(다크 모드 자동 전환·글꼴 크기 등)으로 화면이 다시 만들어지면 레이아웃은 고지 화면으로 돌아온다.
+        // 차단 화면에 있었다면 차단 화면을 그대로 보여 주고 그 짧은 안내만 한다 — 예전에는 긴 고지를 처음부터 다시 읽었다.
+        if (savedInstanceState?.getBoolean(STATE_BLOCKED, false) == true) showBlocked() else showNotice()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // 이미 동의해 곧바로 닫히는 경우엔 화면을 만들지 않았다.
+        if (::blockedContainer.isInitialized) {
+            outState.putBoolean(STATE_BLOCKED, blockedContainer.visibility == View.VISIBLE)
+        }
     }
 
     /** 고지를 읽던 중에 화면을 떠났다 — 돌아오면 처음부터 다시 들려준다. */
@@ -187,6 +197,7 @@ class SafetyNoticeActivity : AppCompatActivity() {
     companion object {
         private const val PREFS = "safewalk_prefs"
         private const val KEY_AGREED = "hasAgreedToSafetyNotice"
+        private const val STATE_BLOCKED = "blockedShowing"
 
         /**
          * TalkBack 이 꺼진 사용자용 — 버튼을 눈으로 못 찾으므로 위치를 말해 준다.

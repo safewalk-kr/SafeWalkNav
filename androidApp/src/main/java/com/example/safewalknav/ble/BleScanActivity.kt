@@ -51,9 +51,13 @@ import java.util.Locale
  *    정해져 있는데, 아직 확보하지 못했다. 공공 교통시설에 추측한 명령을 보내지 않는다.
  *
  * 그래서 지금은:
- *  - 10초 동안 주변 BLE 광고를 모아 이름·주소·신호 세기·서비스 UUID·제조사 ID·원본 바이트를 보여 주고
+ *  - [다시 찾기] 를 누르면 10초 동안 주변 BLE 광고를 모아 이름·주소·신호 세기·서비스 UUID·제조사 ID·원본 바이트를 보여 주고
  *  - [기록 공유] 로 팀에 보낸다. 교차로마다 모으면 "서울에 스마트 음향신호기가 실제로 있는지",
  *    "어떤 이름으로 광고하는지"를 규격서 도착 전에 확인할 수 있다.
+ *
+ * 화면에 들어오기만 해서는 **권한을 묻지도, 찾지도 않는다**(2026-11). 홈 맨 아래 버튼이라 손끝이 가장 먼저
+ * 닿아 잘못 들어오는 사람이 많은데, 예전엔 들어오자마자 권한 창이 두 번 떠서 쓸 수도 없는 기능의 창에 갇혔다.
+ * 들어오면 "준비 중이라 켤 수 없다 + 뒤로 가는 법"만 말하고, 권한은 [다시 찾기] 를 누를 때 묻는다.
  *
  * ⚠️ 안드로이드는 앱당 30초에 startScan 5회까지만 허용한다(넘기면 조용히 결과가 안 온다).
  *    그래서 스캔 중에는 [다시 찾기] 가 새 스캔을 시작하지 않는다 — 버튼은 "찾는 중"으로 바뀌고,
@@ -94,7 +98,7 @@ class BleScanActivity : AppCompatActivity() {
      * 아직 아무 말도 안 했으면 지금 화면 상태를 말한다.
      */
     private val volumeRepeat = VolumeDownRepeat(this) {
-        if (!speaker.repeatLast()) speaker.speak(if (hasScanPermissions()) RESTORED else permissionMessage())
+        if (!speaker.repeatLast()) speaker.speak(stateMessage())
     }
 
     private val callback = object : ScanCallback() {
@@ -131,6 +135,9 @@ class BleScanActivity : AppCompatActivity() {
 
     /** 안내를 말하던 중에 화면을 떠났다 — 돌아오면 지금 상태를 다시 말해 준다. */
     private var speechCutOff = false
+
+    /** 이 화면에서 [다시 찾기] 를 한 번이라도 눌렀다 — 그 전에는 권한 얘기를 꺼내지 않는다([stateMessage]). */
+    private var scanRequested = false
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -174,23 +181,24 @@ class BleScanActivity : AppCompatActivity() {
                 speaker.speak(STILL_SCANNING)
                 return@setOnClickListener
             }
-            ensurePermissionsThenScan(fromButton = true)
+            scanRequested = true
+            ensurePermissionsThenScan()
         }
         btnShare.setOnClickListener { shareLog() }
 
         if (savedInstanceState == null) {
-            // 권한 창 예고는 첫 안내에 붙여 한 번에 — 따로 말하면 엔진 준비 전이라 첫 안내가 덮인다.
-            val dialogHint = if (!hasScanPermissions() && !speaker.isScreenReaderOn()) " ${permissionDialogHint()}" else ""
-            speaker.speak(INTRO + dialogHint)
-            ensurePermissionsThenScan(fromButton = false)
+            // 들어오기만 해서는 권한 창도, 블루투스 조사도 시작하지 않는다(클래스 주석) — 할 수 없는 것과 나가는 길만.
+            // 권한 창 예고는 [다시 찾기] 를 누를 때 한다(ensurePermissionsThenScan).
+            speaker.speak(INTRO)
         } else {
             // 재생성(프로세스 복원 등) 때는 권한 창을 또 띄우지 않는다 — 떠 있던 창의 결과는 새 인스턴스로 온다.
             // 대신 상태를 되살리고 지금 어떤 상태인지 한 번 말한다(글씨는 저장되지 않아 빈 화면이 된다).
             sentToSettings = savedInstanceState.getBoolean(STATE_SENT_TO_SETTINGS, false)
             permissionBlocked = savedInstanceState.getBoolean(STATE_PERMISSION_BLOCKED, false)
+            scanRequested = savedInstanceState.getBoolean(STATE_SCAN_REQUESTED, false)
             updateScanButton()
             if (!sentToSettings) {
-                speaker.speak(if (hasScanPermissions()) RESTORED else permissionMessage())
+                speaker.speak(stateMessage())
             }
         }
     }
@@ -199,6 +207,18 @@ class BleScanActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_SENT_TO_SETTINGS, sentToSettings)
         outState.putBoolean(STATE_PERMISSION_BLOCKED, permissionBlocked)
+        outState.putBoolean(STATE_SCAN_REQUESTED, scanRequested)
+    }
+
+    /**
+     * 지금 상태 한 마디(돌아왔을 때·재생성·다시 듣기용).
+     * 아직 [다시 찾기] 를 누르지 않았으면 첫 안내 그대로 — 잘못 들어온 사람에게 묻지도 않은 권한 얘기를 하면
+     * 무엇을 해야 할지 더 헷갈린다. 빠져나가는 길이 먼저다.
+     */
+    private fun stateMessage(): String = when {
+        !scanRequested -> INTRO
+        hasScanPermissions() -> RESTORED
+        else -> permissionMessage()
     }
 
     override fun onResume() {
@@ -221,7 +241,7 @@ class BleScanActivity : AppCompatActivity() {
         // 안내를 듣다가 나갔다 돌아옴 — 조용하면 어느 화면인지 모른다. 지금 상태를 한 마디로.
         if (speechCutOff) {
             speechCutOff = false
-            speaker.speak(if (hasScanPermissions()) RESTORED else permissionMessage())
+            speaker.speak(stateMessage())
         }
     }
 
@@ -320,25 +340,41 @@ class BleScanActivity : AppCompatActivity() {
      *  - 12+: 근처 기기 창과 위치 창이 **따로** 뜬다. 하나만 빠졌으면 창도 하나.
      *  - 10~11: 위치 창 하나, 맨 위가 '앱 사용 중에만 허용'.
      *  - 8~9: 버튼이 가로로 놓이고 '허용'이 오른쪽.
+     *
+     * 끝에 도움을 청하는 길을 붙인다 — 위치로 말해 줘도 손끝으로 창 버튼을 찾지 못하는 사람이 있다.
+     * 부탁할 때 부를 버튼 이름은 실제 이름으로. 12+ 에서 근처 기기 창의 맨 위는 '허용'이지만, 위치 창의 맨 위는
+     * '앱 사용 중에만 허용'이다 — 위치가 빠졌으면 그 이름을 말한다('허용'만 말하면 '허용 안함'과도 헷갈린다).
      */
-    private fun permissionDialogHint(): String = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
-            if (missingPermissions().size >= 2) "곧 권한 창이 두 번 뜹니다. 두 번 모두 버튼 중 맨 위를 눌러 주세요."
-            else "곧 권한 창이 뜹니다. 버튼 중 맨 위를 눌러 주세요."
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ->
-            "곧 위치 권한 창이 뜹니다. 버튼 중 맨 위의 '앱 사용 중에만 허용'을 눌러 주세요."
-        else -> "곧 위치 권한 창이 뜹니다. 오른쪽 아래의 허용을 눌러 주세요."
+    private fun permissionDialogHint(): String {
+        val (where, allowLabel) = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                val missing = missingPermissions()
+                val where = if (missing.size >= 2) "곧 권한 창이 두 번 뜹니다. 두 번 모두 버튼 중 맨 위를 눌러 주세요."
+                else "곧 권한 창이 뜹니다. 버튼 중 맨 위를 눌러 주세요."
+                val needsLocation = missing.any {
+                    it == Manifest.permission.ACCESS_FINE_LOCATION || it == Manifest.permission.ACCESS_COARSE_LOCATION
+                }
+                val needsNearby = missing.any { !it.startsWith("android.permission.ACCESS_") }
+                val label = when {
+                    needsLocation && needsNearby -> "허용'과 '앱 사용 중에만 허용"
+                    needsLocation -> "앱 사용 중에만 허용"
+                    else -> "허용"
+                }
+                where to label
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ->
+                "곧 위치 권한 창이 뜹니다. 버튼 중 맨 위의 '앱 사용 중에만 허용'을 눌러 주세요." to "앱 사용 중에만 허용"
+            else -> "곧 위치 권한 창이 뜹니다. 오른쪽 아래의 허용을 눌러 주세요." to "허용"
+        }
+        return "$where 혼자 찾기 어려우면 주변 분께 '$allowLabel'을 눌러 달라고 부탁해 주세요."
     }
 
-    /**
-     * @param fromButton 사용자가 버튼으로 시작했다. 화면에 들어오며 자동으로 시작할 때는 INTRO 가
-     *   이미 권한 창 예고까지 했으므로 다시 말하지 않고, 찾기 시작 안내도 하지 않는다(INTRO 를 덮지 않게).
-     */
-    private fun ensurePermissionsThenScan(fromButton: Boolean) {
+    /** [다시 찾기] 를 눌렀을 때만 부른다 — 화면에 들어오는 것만으로는 권한을 묻지 않는다(클래스 주석). */
+    private fun ensurePermissionsThenScan() {
         when {
             hasScanPermissions() -> {
                 permissionBlocked = false
-                startScan(announceStart = fromButton)
+                startScan(announceStart = true)
             }
             permissionBlocked -> {
                 // TalkBack 없이 설정 화면의 권한 항목을 찾기는 매우 어렵다 — 도움을 청하는 길과 돌아오는 법을 함께.
@@ -349,7 +385,7 @@ class BleScanActivity : AppCompatActivity() {
             else -> {
                 // TalkBack 없이 쓰는 사람은 권한 창이 떴다는 것도 알 수 없다 — 미리 말해 둔다.
                 // (TalkBack 사용자는 TalkBack 이 창을 읽는다)
-                if (fromButton && !speaker.isScreenReaderOn()) speaker.speak(permissionDialogHint())
+                if (!speaker.isScreenReaderOn()) speaker.speak(permissionDialogHint())
                 permissionRequestedAt = PermissionGate.markRequested()
                 permissionDialogShowing = true   // 권한 창이 이 화면을 가려도(onPause) 위 안내는 끝까지 들려준다
                 permissionLauncher.launch(requestedPermissions())
@@ -415,8 +451,8 @@ class BleScanActivity : AppCompatActivity() {
         ScanBudget.recordStart(SystemClock.elapsedRealtime())
         scanning = true
         lastScanAt = System.currentTimeMillis()
-        // 화면 진입 때 자동으로 시작한 경우엔 상태 글씨를 바꾸지 않는다 — 라이브 리전이라, 바꾸면 TalkBack 이
-        // 읽던 첫 안내를 끊는다. 버튼 글씨 "찾는 중"이 스캔 중이라는 표시가 된다.
+        // 시작을 알리지 않는 경우엔 상태 글씨도 바꾸지 않는다 — 라이브 리전이라, 바꾸면 TalkBack 이
+        // 읽던 안내를 끊는다. 버튼 글씨 "찾는 중"이 스캔 중이라는 표시가 된다.
         if (announceStart) speaker.speak(SCANNING)
         updateScanButton()
         // 10초 중에 화면이 꺼지면 onPause 로 스캔이 반쯤에서 멈춘다(짧은 화면 꺼짐 시간을 쓰는 사람이 많다).
@@ -617,8 +653,11 @@ class BleScanActivity : AppCompatActivity() {
         private const val SHARE_MAX_DEVICES = 100
         private const val SCREEN_MAX_DEVICES = 30
 
+        // 잘못 들어온 사람이 많은 화면 — 할 수 없다는 것과 나가는 길을 먼저, 조사는 버튼을 눌러야만 한다는 것을 끝에.
+        // 버튼 이름은 [다시 찾기] 의 실제 글씨와 같게.
         private const val INTRO =
-            "음향신호기는 아직 켤 수 없습니다. 지금은 주변 블루투스 장치를 찾아 기록만 합니다."
+            "음향신호기는 아직 준비 중이라 켤 수 없습니다. 홈으로 돌아가려면 뒤로 가기를 누르세요. " +
+                "블루투스 조사는 다시 찾기 버튼을 누를 때만 합니다."
         private const val SCANNING = "주변 장치를 찾고 있습니다. 약 10초 걸립니다."
         private const val STILL_SCANNING = "아직 찾는 중입니다."
         private const val PERMISSION_DENIED =
@@ -636,16 +675,17 @@ class BleScanActivity : AppCompatActivity() {
         private const val OPENING_SETTINGS_HELP =
             " 혼자 하기 어려우면 주변 분께 SafeWalk의 근처 기기와 위치 권한을 켜 달라고 부탁하세요. 뒤로 가기를 누르면 이 화면으로 돌아옵니다."
         private const val RESTORED =
-            "음향신호기 화면입니다. 다시 찾기를 누르면 주변 블루투스 장치를 찾습니다."
+            "음향신호기 준비 중 화면입니다. 다시 찾기를 누르면 주변 블루투스 장치를 찾습니다."
 
         private const val STATE_SENT_TO_SETTINGS = "sentToSettings"
         private const val STATE_PERMISSION_BLOCKED = "permissionBlocked"
+        private const val STATE_SCAN_REQUESTED = "scanRequested"
     }
 }
 
 /**
  * 안드로이드의 BLE 스캔 시작 제한(앱당 30초에 5회) 회계. 프로세스 전체에서 공유한다 —
- * 화면을 새로 열 때마다 자동으로 찾기를 시작하므로, 들락날락하면 화면 하나 안에서 세는 걸로는 부족하다.
+ * 시스템은 앱 전체로 세므로, 화면을 들락날락하며 [다시 찾기] 를 누르면 화면 하나 안에서 세는 걸로는 부족하다.
  * 여유를 두고 4회로 센다(시스템이 세는 시작에는 우리가 모르는 재시도가 섞일 수 있다).
  */
 internal object ScanBudget {

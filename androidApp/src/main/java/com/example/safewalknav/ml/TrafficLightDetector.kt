@@ -3,6 +3,7 @@ package com.example.safewalknav.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -20,6 +21,11 @@ import kotlin.math.min
  * HYBRID_P2      : 자체 YOLOv11n + P2 head, 939장, 2 classes, 출력 [1,6,34000] (objectness 없음)
  *
  * 앱 계약: detect() 의 classId 는 항상 0=빨강, 1=초록. 모델이 무엇이든 불변.
+ *
+ * 스레드: 생성자는 메인 스레드 전용 API(Looper·View·Toast)를 쓰지 않는다 — assets 매핑과
+ * Interpreter 생성뿐이라 백그라운드 executor 에서 만들어도 된다. [context] 는 생성 중에만 쓰고
+ * 보관하지 않는다(Activity 누수 없음). 단, 생성한 스레드와 분석 스레드가 다르면 executor 제출·
+ * Handler post 같은 happens-before 경로로 넘길 것 (`interpreter` 등은 final 이 아니다).
  */
 class TrafficLightDetector(context: Context) {
 
@@ -78,6 +84,16 @@ class TrafficLightDetector(context: Context) {
     // ── 재사용 버퍼 (입력 크기가 모델당 고정이라 한 번만 잡으면 된다) ──
     private var inputBuffer: ByteBuffer? = null
     private var pixelCache: IntArray? = null
+
+    /** 입력 텐서를 bulk put 한 번에 채우기 위한 float 스테이징 (640×640×3 = 4.9MB, 한 번만 할당). */
+    private var inputFloats: FloatArray? = null
+
+    /**
+     * 출력 텐서 수신 버퍼. **인터프리터에 딸린 것으로 취급한다** — [fallbackToCpu] 가 인터프리터를
+     * 갈아 끼우면 null 로 비워, 다음 프레임에 새 인터프리터의 출력 텐서를 다시 검사하고 만든다.
+     * 분석 스레드(단일)에서만 접근하므로 동기화 불필요.
+     */
+    private var outputBuffers: OutputBuffers? = null
 
     init {
         fun options(useNnapi: Boolean) = Interpreter.Options().apply {
@@ -163,6 +179,9 @@ class TrafficLightDetector(context: Context) {
             })
             try { interpreter.close() } catch (_: Exception) {}
             interpreter = cpu
+            // 출력 버퍼는 옛 인터프리터의 출력 텐서를 기준으로 검사·할당한 것이다. 같은 모델이라
+            // shape 는 같겠지만, 새 인터프리터 기준으로 다시 검사하도록 비운다 (1회 0.8MB 재할당).
+            outputBuffers = null
             usingNnapi = false
             Log.w(TAG, "추론이 계속 실패해 NNAPI → CPU 로 전환")
             true
@@ -172,6 +191,10 @@ class TrafficLightDetector(context: Context) {
         }
     }
 
+    /**
+     * [bitmap] 은 **호출자 소유**다. detect() 는 이걸 recycle 하지 않고, 반환 뒤에 참조도 남기지 않는다
+     * (픽셀은 [preprocess] 안에서 입력 버퍼로 복사가 끝난다). 그래서 호출자는 반환 직후 recycle 해도 된다.
+     */
     fun detect(bitmap: Bitmap): List<TrafficLightDetection> {
         val t0 = System.nanoTime()
         val input = preprocess(bitmap)
@@ -196,14 +219,71 @@ class TrafficLightDetector(context: Context) {
     }
 
     /**
+     * 추론 1회 → 출력 텐서 전체를 **평탄(row-major) FloatArray** 로 돌려준다.
+     * 반환 배열은 재사용되며 다음 호출에서 덮어써진다 (분석 스레드 단일 사용이라 안전).
+     *
+     * 예전에는 `Array(1) { Array(N) { FloatArray(C) } }` 를 매 프레임 새로 만들었다.
+     * YOLOv5 [1,25500,8] 이면 프레임마다 객체 25,502개·약 1.3MB 가 GC 로 갔고, LiteRT 는
+     * 행마다 JNI 복사(SetFloatArrayRegion)를 25,500번 했다. 직접 버퍼로 받으면
+     * 네이티브 memcpy 한 번 + bulk get 한 번이다.
+     *
+     * 값이 비트 단위로 같은 이유: 두 경로 모두 텐서 메모리의 float32 비트를 row-major 순서 그대로
+     * 옮길 뿐, 연산·형 변환이 없다. 단 바이트 순서는 LiteRT 의 텐서 버퍼와 같은 nativeOrder 여야 한다
+     * (다르면 float 이 바이트 단위로 뒤섞인다).
+     */
+    private fun runInference(input: ByteBuffer): FloatArray {
+        val ob = outputBuffers ?: createOutputBuffers().also { outputBuffers = it }
+        // LiteRT 는 출력 ByteBuffer 에 상대 put 을 한다(position 이 끝으로 간다).
+        // 지난 프레임의 position 이 남아 있으면 overflow 이므로 매번 처음으로 되돌린다.
+        ob.bytes.rewind()
+        interpreter.run(input, ob.bytes)
+        ob.bytes.rewind()
+        ob.bytes.asFloatBuffer().get(ob.floats)
+        return ob.floats
+    }
+
+    /**
+     * 현재 [interpreter] 의 출력 텐서에 맞는 수신 버퍼를 만든다.
+     *
+     * ⚠️ shape·dtype 검사를 **여기서 직접, 예전과 똑같이 엄격하게** 한다.
+     * 예전 다차원 배열 경로에서는 LiteRT 가 텐서 shape 가 배열 shape([1,N,C] 등)와 하나라도 다르거나
+     * dtype 이 FLOAT32 가 아니면 run() 에서 IllegalArgumentException 을 던졌다 → 분석기 실패 경로 →
+     * 실패 안내. 그런데 ByteBuffer 출력은 LiteRT 가 dtype 검사를 건너뛰고 용량도 "이상인지"만 본다.
+     * 그대로 두면 모델이 바뀌었을 때 엉뚱한 레이아웃으로 디코딩하며 **조용히** 돈다 —
+     * 빨강↔초록 뒤바뀜이 실패 안내 없이 나갈 수 있다. 그래서 같은 조건에서 같은 예외를 던진다.
+     * 통과 못 하면 캐시하지 않으므로 매 프레임 다시 던진다 (예전과 같은 동작).
+     */
+    private fun createOutputBuffers(): OutputBuffers {
+        val tensor = interpreter.getOutputTensor(0)
+        val actual = tensor.shape()
+        // 예전 코드가 넘기던 배열의 shape 그대로 — Array(1){Array(A){FloatArray(C)}} → [1, A, C] 등.
+        val expected = when (spec.kind) {
+            ModelKind.KAIRESS_YOLOV5 -> intArrayOf(1, spec.numAnchors, spec.numOutputChannels)
+            ModelKind.HYBRID_P2 -> intArrayOf(1, spec.numOutputChannels, spec.numAnchors)
+        }
+        if (tensor.dataType() != DataType.FLOAT32 || !actual.contentEquals(expected)) {
+            throw IllegalArgumentException(
+                "출력 텐서 불일치: 기대 FLOAT32 ${expected.contentToString()}, " +
+                    "실제 ${tensor.dataType()} ${actual.contentToString()}"
+            )
+        }
+        var count = 1
+        for (d in actual) count *= d
+        return OutputBuffers(
+            bytes = ByteBuffer.allocateDirect(4 * count).order(ByteOrder.nativeOrder()),
+            floats = FloatArray(count),
+        )
+    }
+
+    /**
      * YOLOv5: [1, 25500, 8] anchor-major. row = [cx,cy,w,h,obj, zebra,red,green]
      * confidence = objectness × class_score  (objectness 를 빼먹으면 배경도 고득점 → 오탐 폭증)
      * 리매핑: R_Signal(1)→앱0(red), G_Signal(2)→앱1(green), Zebra_Cross(0)→제외
      */
     private fun runYolov5(input: ByteBuffer, threshold: Float): PostprocessResult {
-        val output = Array(1) { Array(spec.numAnchors) { FloatArray(spec.numOutputChannels) } }
-        interpreter.run(input, output)
-        val rows = output[0]
+        // 평탄 [1, A, C] row-major: 예전 output[0][i][k] == out[i * C + k]
+        val out = runInference(input)
+        val numCh = spec.numOutputChannels
 
         val candidates = ArrayList<TrafficLightDetection>(64)
         var peakAll = 0f; var peakRed = 0f; var peakGreen = 0f
@@ -215,11 +295,11 @@ class TrafficLightDetector(context: Context) {
         var bestAimCx = -1f
 
         for (i in 0 until spec.numAnchors) {
-            val row = rows[i]
-            val obj = row[4]
-            val confCrosswalk = obj * row[5 + CLS_ZEBRA]
-            val confRed = obj * row[5 + CLS_R_SIGNAL]
-            val confGreen = obj * row[5 + CLS_G_SIGNAL]
+            val b = i * numCh   // anchor i 행의 시작 — 예전 rows[i][k] 가 out[b + k]
+            val obj = out[b + 4]
+            val confCrosswalk = obj * out[b + 5 + CLS_ZEBRA]
+            val confRed = obj * out[b + 5 + CLS_R_SIGNAL]
+            val confGreen = obj * out[b + 5 + CLS_G_SIGNAL]
 
             // peak 는 threshold 무관하게 전 anchor 집계 — "임계 아래라도 보고는 있는가" 진단용.
             if (confRed > peakRed) peakRed = confRed
@@ -229,7 +309,7 @@ class TrafficLightDetector(context: Context) {
                 // 가장 확신 높은 횡단보도 anchor 의 가로 중심을 정렬 안내용으로 기록.
                 if (confCrosswalk > bestCrosswalkConf) {
                     bestCrosswalkConf = confCrosswalk
-                    bestCrosswalkCx = decodeBbox(row[0], row[1], row[2], row[3]).xCenter
+                    bestCrosswalkCx = decodeBbox(out[b], out[b + 1], out[b + 2], out[b + 3]).xCenter
                 }
             }
 
@@ -243,7 +323,7 @@ class TrafficLightDetector(context: Context) {
             // (decodeBbox 는 이 가지에서만 도는데, 0.10 을 넘는 anchor 는 극소수라 비용 무시 가능)
             if (score >= AIM_CONFIDENCE && score > bestAimConf && confCrosswalk <= score) {
                 bestAimConf = score
-                bestAimCx = decodeBbox(row[0], row[1], row[2], row[3]).xCenter
+                bestAimCx = decodeBbox(out[b], out[b + 1], out[b + 2], out[b + 3]).xCenter
             }
 
             if (score < threshold) continue
@@ -254,7 +334,7 @@ class TrafficLightDetector(context: Context) {
                 classId = appClassId,
                 label = APP_CLASS_NAMES[appClassId],
                 confidence = score,
-                bbox = decodeBbox(row[0], row[1], row[2], row[3]),
+                bbox = decodeBbox(out[b], out[b + 1], out[b + 2], out[b + 3]),
             )
         }
 
@@ -271,9 +351,16 @@ class TrafficLightDetector(context: Context) {
 
     /** YOLOv11: [1, 6, 34000] channel-major. objectness 없음 (anchor-free). */
     private fun runYolov11(input: ByteBuffer, threshold: Float): PostprocessResult {
-        val output = Array(1) { Array(spec.numOutputChannels) { FloatArray(spec.numAnchors) } }
-        interpreter.run(input, output)
-        val ch = output[0]
+        // 평탄 [1, C, A] row-major (채널 우선): 예전 output[0][k][i] == out[k * A + i]
+        val out = runInference(input)
+        val n = spec.numAnchors
+        // 채널 k 행의 시작 오프셋 (예전 ch[k]). 채널 4 = 빨강, 5 = 초록 (예전 ch[4]·ch[5] 와 같다).
+        val offCx = 0
+        val offCy = n
+        val offW = 2 * n
+        val offH = 3 * n
+        val offRed = 4 * n
+        val offGreen = 5 * n
 
         val candidates = ArrayList<TrafficLightDetection>(64)
         var peakAll = 0f; var peakRed = 0f; var peakGreen = 0f
@@ -281,9 +368,9 @@ class TrafficLightDetector(context: Context) {
         var bestAimConf = 0f
         var bestAimCx = -1f
 
-        for (i in 0 until spec.numAnchors) {
-            val scoreRed = ch[4][i]
-            val scoreGreen = ch[5][i]
+        for (i in 0 until n) {
+            val scoreRed = out[offRed + i]
+            val scoreGreen = out[offGreen + i]
             if (scoreRed > peakRed) peakRed = scoreRed
             if (scoreGreen > peakGreen) peakGreen = scoreGreen
 
@@ -296,7 +383,7 @@ class TrafficLightDetector(context: Context) {
             // 조준용 (runYolov5 와 동일 규칙). 이 모델엔 횡단보도 클래스가 없어 폴백이 없다.
             if (maxScore >= AIM_CONFIDENCE && maxScore > bestAimConf) {
                 bestAimConf = maxScore
-                bestAimCx = decodeBbox(ch[0][i], ch[1][i], ch[2][i], ch[3][i]).xCenter
+                bestAimCx = decodeBbox(out[offCx + i], out[offCy + i], out[offW + i], out[offH + i]).xCenter
             }
 
             if (maxScore < threshold) continue
@@ -306,7 +393,7 @@ class TrafficLightDetector(context: Context) {
                 classId = maxClass,
                 label = APP_CLASS_NAMES[maxClass],
                 confidence = maxScore,
-                bbox = decodeBbox(ch[0][i], ch[1][i], ch[2][i], ch[3][i]),
+                bbox = decodeBbox(out[offCx + i], out[offCy + i], out[offW + i], out[offH + i]),
             )
         }
 
@@ -403,6 +490,9 @@ class TrafficLightDetector(context: Context) {
             scaled =
                 if (side == size) square
                 else Bitmap.createScaledBitmap(square, size, size, true)
+            // 중간 크롭 비트맵은 축소본을 만든 뒤 쓸 일이 없다. 호출자 것(bitmap)이거나
+            // 그대로 scaled 로 쓰이는 경우(아래에서 반납)는 건드리지 않는다.
+            if (square !== bitmap && square !== scaled) square.recycle()
         } else {
             // 크롭 이전 동작: 전체 프레임을 640×640 으로 (비율은 눌리지만 학습과 같은 방식).
             // bbox 는 원본 프레임 전체 기준이므로 환원 계수는 항등.
@@ -425,12 +515,27 @@ class TrafficLightDetector(context: Context) {
         buffer.clear()
 
         val pixels = pixelCache ?: IntArray(size * size).also { pixelCache = it }
-        scaled.getPixels(pixels, 0, size, 0, 0, size, size)
-        for (p in pixels) {
-            buffer.putFloat(((p shr 16) and 0xFF) / 255.0f)
-            buffer.putFloat(((p shr 8) and 0xFF) / 255.0f)
-            buffer.putFloat((p and 0xFF) / 255.0f)
+        try {
+            scaled.getPixels(pixels, 0, size, 0, 0, size, size)
+        } finally {
+            // 축소본(640×640 ≈ 1.6MB 네이티브)은 픽셀을 꺼낸 순간 끝이다. GC 를 기다리지 않고 바로 반납.
+            // createScaledBitmap 은 크기가 같으면 원본을 그대로 돌려줄 수 있다 — 그건 호출자 소유라 두고 간다.
+            if (scaled !== bitmap) scaled.recycle()
         }
+
+        // 픽셀당 putFloat 3번(프레임당 약 123만 번 호출)을 없앤다: LUT 로 FloatArray 를 채우고 bulk put 한 번.
+        // NORM_LUT[v] 는 예전 식 `v / 255.0f` 를 그대로 미리 계산해 둔 값이라 비트 단위로 같다.
+        // 채널 순서(R,G,B)·픽셀 순서(getPixels 의 row-major)도 예전과 같다.
+        // asFloatBuffer() 뷰는 buffer 의 nativeOrder 를 물려받으므로 putFloat 와 같은 바이트가 써진다.
+        val floats = inputFloats ?: FloatArray(size * size * 3).also { inputFloats = it }
+        var j = 0
+        for (p in pixels) {
+            floats[j] = NORM_LUT[(p shr 16) and 0xFF]
+            floats[j + 1] = NORM_LUT[(p shr 8) and 0xFF]
+            floats[j + 2] = NORM_LUT[p and 0xFF]
+            j += 3
+        }
+        buffer.asFloatBuffer().put(floats)
         buffer.rewind()
         return buffer
     }
@@ -454,12 +559,24 @@ class TrafficLightDetector(context: Context) {
         return if (union > 0f) inter / union else 0f
     }
 
+    /**
+     * ⚠️ detect() 와 **동시에** 부르면 안 된다 (run() 도중 네이티브 해제 → SIGSEGV).
+     * 분석과 같은 단일 executor 에서 부르면 analyze() 와 자연히 직렬화돼 안전하고,
+     * 다른 스레드에서 부를 거면 분석 executor 가 끝난 뒤(awaitTermination 성공 후)에만 부를 것.
+     * 여러 번 불러도 된다(Interpreter.close() 는 멱등). 닫힌 뒤의 detect() 는
+     * IllegalStateException 으로 끝나 분석기의 실패 경로로 간다(네이티브 크래시 아님).
+     */
     fun close() {
         try { interpreter.close() } catch (_: Exception) {}
-        // 직접 버퍼 4.7MB 는 GC 가 회수하지만, 참조를 끊어 즉시 반환되게 한다.
+        // 직접 버퍼(입력 4.9MB·출력 0.8MB)는 GC 가 회수하지만, 참조를 끊어 즉시 반환되게 한다.
         inputBuffer = null
         pixelCache = null
+        inputFloats = null
+        outputBuffers = null
     }
+
+    /** 출력 텐서 수신용 직접 버퍼 + 그걸 풀어 둘 평탄 배열. 둘은 항상 같은 원소 수다. */
+    private class OutputBuffers(val bytes: ByteBuffer, val floats: FloatArray)
 
     private data class PostprocessResult(
         val detections: List<TrafficLightDetection>,
@@ -516,6 +633,12 @@ class TrafficLightDetector(context: Context) {
         )
 
         const val DIAGNOSTIC_CONFIDENCE_THRESHOLD: Float = 0.15f
+
+        /**
+         * 0~255 → 0~1 정규화 표. **예전 식 `v / 255.0f` 와 똑같은 나눗셈**이다 (Int / Float).
+         * ⚠️ `v * (1f / 255f)` 로 바꾸지 말 것 — 일부 값에서 1 ulp 달라져 모델 입력이 바뀐다.
+         */
+        private val NORM_LUT = FloatArray(256) { it / 255.0f }
 
         /**
          * 조준 진동 전용 문턱. 판정 문턱(0.25)보다 낮다.

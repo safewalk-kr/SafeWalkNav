@@ -4,10 +4,14 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -18,6 +22,7 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityManager
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -36,6 +41,7 @@ import com.example.safewalknav.a11y.AudioRouting
 import com.example.safewalknav.a11y.PermissionGate
 import com.example.safewalknav.a11y.Speaker
 import com.example.safewalknav.a11y.SpeechFocus
+import com.example.safewalknav.a11y.VolumeDownRepeat
 import com.example.safewalknav.ml.MotionGate
 import com.example.safewalknav.ml.TrafficLightAnalyzer
 import com.example.safewalknav.ml.TrafficLightDetection
@@ -47,6 +53,7 @@ import com.example.safewalknav.navigation.signal.SignalTransition
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -106,6 +113,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     /** 볼륨 다운 롱프레스를 이미 처리했는가. 키를 뗄 때 짧은 누름으로 중복 처리하지 않기 위함. */
     private var volumeLongPressHandled = false
 
+    /**
+     * 지금 누르고 있는 볼륨 다운의 downTime. 이 앱이 DOWN 을 직접 받은 누름만 처리한다.
+     * 전화가 울릴 때 볼륨 키를 누르면 시스템이 DOWN 을 가져가(벨소리 끄기) UP 만 앱에 넘긴다 —
+     * 그 UP 을 다시 듣기로 치면 벨소리 위로 지난 안내가 나왔다.
+     */
+    private var volumeDownSeenAt = NO_KEY_PRESS
+
+    /**
+     * 롱프레스 문턱을 시스템(0.4~0.5초) 대신 직접 잰다([VolumeDownRepeat.LONG_PRESS_MS] = 1초).
+     * 천천히 누르는 어르신은 0.5초를 쉽게 넘겨, 다시 듣기를 누르려다 **의도치 않게 일시정지**했다 —
+     * 이 앱에서 가장 위험한 실수(영구 침묵)다. 다른 화면과 문턱을 같게 둔다.
+     */
+    private val volumeKeyHandler = Handler(Looper.getMainLooper())
+    private val volumeLongPressRunnable = Runnable { onVolumeLongPress() }
+
     /** 일시정지 재알림을 몇 번 했는가. 일부러 멈춘 사람에게 영원히 잔소리하지 않기 위한 상한. */
     private var pausedReminderCount = 0
 
@@ -125,8 +147,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      *
      * TTS: 기본값(USAGE_MEDIA)은 미디어 볼륨을 타는데, 시각장애인 사용자는 미디어를 0 으로
      *      두고 접근성 볼륨만 쓰는 경우가 흔하다. 그러면 앱이 통째로 무음이 된다.
-     * 진동: 속성이 없으면 USAGE_UNKNOWN 이라 절전 모드·시스템 진동 설정에서 억제된다.
-     *      접근성 용도는 그 억제에서 면제된다.
+     * 진동: 속성이 없으면 USAGE_UNKNOWN 이라 시스템 진동 설정(터치 진동 끔 등)에서 억제된다.
+     *      ⚠️ 절전 모드에서는 접근성 용도라도 **면제되지 않는다**(AOSP 기준 — 절전 모드가 진동을 끄는
+     *      기기에서, 켜진 접근성 서비스가 하나도 없으면 모든 진동이 사라진다). [checkDeviceHealth] 가 알린다.
      */
     private val a11yAudioAttributes: AudioAttributes by lazy {
         AudioAttributes.Builder()
@@ -189,10 +212,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * 끝까지")과 반대다.
      * 이 동안은 조준·미탐지 안내·"천천히 움직여 주세요"를 내지 않고, 빨간불·점멸 문구를 바꾼다.
      * 안전 판정(색 확정)은 그대로 돈다.
+     *
+     * ⚠️ 카메라가 멈췄다 켜져도(일시정지·전원 키·통화·화면 재생성) **지우지 않는다.** 이건 엔진 상태가 아니라
+     * 사용자의 몸이 차도 위에 있을 수 있다는 사실이다. 예전에는 stopCamera 가 지워서, 건너다 실수로
+     * 일시정지했다 풀면 첫 빨간불에 "정지하세요"와 조준 진동이 차도 한가운데서 되살아났다. 끝은 시간뿐이다.
      */
     private var crossingUntilMs = 0L
 
     private fun inCrossingWindow(): Boolean = SystemClock.elapsedRealtime() < crossingUntilMs
+
+    /** 건너는 중일 수 있으면 오류·상태 안내 앞에 "멈추지 말고 끝까지"를 붙인다 — 폰 조작 지시보다 먼저. */
+    private fun crossingAware(message: String): String =
+        if (inCrossingWindow()) CROSSING_KEEP_GOING + message else message
 
     /** 마지막 안내의 전환 종류 — 진동·다시 듣기 문구를 "행동" 기준으로 고르는 데 쓴다. 점멸이면 null. */
     private var lastAnnouncedTransition: SignalTransition? = null
@@ -231,6 +262,51 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     /** 모델 로드 실패 — TTS 준비 전에 났을 수 있어, 준비되면 인트로 대신 이걸 말한다. */
     private var modelLoadFailed = false
+
+    /**
+     * 모델(약 25MB)을 분석 스레드에서 여는 중. 예전에는 메인 스레드에서 열어, NNAPI 컴파일이 긴 기기에서
+     * 몇 초간 검은 화면 + 무음이었고 그 사이 키를 누르면 ANR 위험이 있었다.
+     */
+    private var detectorLoading = false
+    private val detectorHandler = Handler(Looper.getMainLooper())
+
+    /** 카메라 provider 는 준비됐는데 모델이 아직 열리는 중 — 모델이 열리면 이걸로 바인딩한다. */
+    private var pendingProvider: ProcessCameraProvider? = null
+    private var pendingPreviewView: PreviewView? = null
+
+    /**
+     * 워치독이 연달아 울린 횟수. 유효 판정이 나오면 0. 상한에 닿으면 자동 일시정지한다 — 카메라 점유·추론 실패가
+     * 계속되면 프레임 결과가 없어 미탐지 자동 일시정지도 안 걸리고, 화면이 켜진 채 45초마다 경고만 끝없이 나왔다.
+     * 0 보다 크면 꾹 누르기는 일시정지가 아니라 다시 켜기다(워치독 문구와 맞춘다).
+     */
+    private var livenessAlarmCount = 0
+
+    /** 이번 카메라 세션이 시작된 시각 — 건너기 창이 열린 **뒤에** 카메라가 다시 켜졌는지 판단용. */
+    private var cameraSessionStartedAtMs = 0L
+
+    /** 볼륨 0 이 아니라 **수화부로 통화 중**이라 안 들리는 것 — 통화가 끝나면 그 사실을 알린다. */
+    private var mutedByCall = false
+
+    /** 배터리·발열·절전 안내를 이 화면에서 이미 했는가 (한 번씩만). */
+    private var batteryLowWarned = false
+    private var batteryCriticalWarned = false
+    private var heatWarned = false
+    private var powerSaveWarned = false
+
+    /**
+     * 화면을 떠날 때 인식이 돌고 있었다 — 돌아와 카메라가 다시 켜질 때 "다시 켰습니다"를 알린다.
+     * 예전에는 전원 키·통화·앱 전환 뒤 카메라만 조용히 다시 켜져, 신호등이 안 보이면 9초 가까이 무음이었다.
+     */
+    private var resumeCueOwed = false
+
+    /** 첫 안내(조작법)가 신호 안내에 잘렸다 — 기다리는 상태가 되면 조작법만 짧게 다시 알린다. 콜백 스레드가 내린다. */
+    @Volatile
+    private var introHintOwed = false
+
+    /** 확정 진동을 조준 진동과 떼어 울리기 위한 짧은 지연. */
+    private val confirmVibrationHandler = Handler(Looper.getMainLooper())
+
+    private val audioManager: AudioManager? by lazy { getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
 
     /**
      * 카메라 권한 거부 — 모델 실패와 같은 이유로 플래그가 필요하다.
@@ -342,17 +418,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             // 건너는 중에는 팔이 흔들리는 게 당연하다 — 그때 "천천히 움직여 주세요"는 걷는 속도 지시로 들린다.
             onSustainedFastMotion = {
                 if (!inCrossingWindow()) {
-                    speakTrafficLight("휴대폰을 천천히 움직여 주세요", interrupt = false, countsAsLiveness = false)
+                    speakTrafficLight("조금 더 천천히 돌려 주세요", interrupt = false, countsAsLiveness = false)
                 }
             },
         )
 
         setIdleVisual()
 
+        // ⚠️ return 보다 먼저 — 일시정지 상태로 복원될 때 빠지면, 재개해도 볼륨 올리기가 앱 음성 볼륨을 안 움직였다.
+        AudioRouting.bindVolumeKeys(this)   // 볼륨 올리기가 앱 음성 볼륨을 움직이게
+
         // 회전·복원으로 다시 만들어졌다면 일시정지 상태를 되살린다.
         userPaused = savedInstanceState?.getBoolean(STATE_USER_PAUSED, false) ?: false
         sentToSettings = savedInstanceState?.getBoolean(STATE_SENT_TO_SETTINGS, false) ?: false
         cameraPermissionBlocked = savedInstanceState?.getBoolean(STATE_CAMERA_PERMISSION_BLOCKED, false) ?: false
+        // 단조 시계(부팅 후 경과)라 프로세스가 죽었다 살아나도 그대로 유효하다.
+        crossingUntilMs = savedInstanceState?.getLong(STATE_CROSSING_UNTIL, 0L) ?: 0L
         setKeepScreenOn(!userPaused)
         if (userPaused) {
             // ⚠️ 남은 알림 횟수도 함께 복원한다. startPausedReminder() 는 횟수를 0 으로
@@ -362,8 +443,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             resumePausedReminder()
             return   // 카메라도 권한 요청도 하지 않는다 — 멈춰 있던 상태 그대로
         }
-
-        AudioRouting.bindVolumeKeys(this)   // 볼륨 올리기가 앱 음성 볼륨을 움직이게
 
         if (hasCameraPermission()) {
             startCamera()
@@ -488,28 +567,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
         cameraPreviewContainer.removeAllViews()
         cameraPreviewContainer.addView(pv)
+        setKeepScreenOn(true)   // 인식 중에는 화면을 켜 둔다(꺼지면 카메라가 멈춘다)
 
-        if (trafficLightDetector == null) {
-            try {
-                trafficLightDetector = TrafficLightDetector(this).apply { diagnosticMode = false }
-                modelLoadFailed = false
-                Log.d(TAG, "TrafficLightDetector loaded")
-            } catch (e: Throwable) {
-                // Throwable — 네이티브 라이브러리 로드 실패(UnsatisfiedLinkError)나 모델 메모리 부족(OOM)은
-                // Exception 이 아니라서, 예전 catch 로는 못 잡고 앱이 통째로 죽었다.
-                Log.e(TAG, "Failed to load TrafficLightDetector", e)
-                overlayStatusText.text = "모델 로드 실패"
-                // 화면 글씨만 바꾸면 시각장애인에게는 '아무 일도 안 일어남'과 구별되지 않는다.
-                // 분석기가 아예 안 붙으므로 미탐지 안내조차 돌지 않아 영영 침묵한다.
-                // onResume 마다 재시도하며 같은 말을 반복하지 않도록 한 번만.
-                if (!modelLoadFailed) {
-                    modelLoadFailed = true
-                    supersedePendingIntro()
-                    speakTts(MODEL_LOAD_FAILED_MESSAGE)
-                }
-            }
-        }
         if (analysisExecutor == null) analysisExecutor = Executors.newSingleThreadExecutor()
+        // 모델은 분석 스레드에서 연다 — 열리면 onDetectorLoaded 가 바인딩을 마저 한다.
+        if (trafficLightDetector == null) loadDetectorInBackground()
 
         // 신호 판정 상태 초기화 + 겨눌 시간(3초)은 미탐지 안내 억제.
         signalDecisionEngine.reset()
@@ -523,6 +585,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         aiming.stop()
         cameraInUseAnnounced = false
         inferenceErrorAnnounced = false
+        livenessAlarmCount = 0
+        cameraSessionStartedAtMs = SystemClock.elapsedRealtime()
         analysisEnabled = true
         lastResultAtMs = SystemClock.elapsedRealtime()
         startLivenessWatchdog()
@@ -530,18 +594,107 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
-            try {
-                val provider = future.get()
-                // provider 획득은 비동기다. 그 사이에 stopCamera 나 더 나중의 startCamera 가
-                // 지나갔다면 이 리스너는 한물간 것이다. 그대로 바인딩하면 이미 컨테이너에서
-                // 떼어낸 PreviewView 에 붙어 검은 화면 + 분석만 도는 좀비 상태가 된다.
-                // 한물간 리스너는 **아무것도 바인딩한 적이 없으므로** unbindAll 하지 않는다.
-                // 여기서 unbind 하면, 만에 하나 리스너 실행 순서가 뒤집혔을 때 살아 있는
-                // 바인딩을 뜯어내 검은 화면으로 만든다. 그냥 빠져나가는 게 안전하다.
-                if (generation != cameraGeneration || !analysisEnabled) {
-                    Log.d(TAG, "stale camera listener (gen=$generation, now=$cameraGeneration) — skip")
-                    return@addListener
+            // provider 획득은 비동기다. 그 사이에 stopCamera 나 더 나중의 startCamera 가
+            // 지나갔다면 이 리스너는 한물간 것이다. 그대로 바인딩하면 이미 컨테이너에서
+            // 떼어낸 PreviewView 에 붙어 검은 화면 + 분석만 도는 좀비 상태가 된다.
+            // 한물간 리스너는 **아무것도 바인딩한 적이 없으므로** unbindAll 하지 않는다.
+            // 여기서 unbind 하면, 만에 하나 리스너 실행 순서가 뒤집혔을 때 살아 있는
+            // 바인딩을 뜯어내 검은 화면으로 만든다. 그냥 빠져나가는 게 안전하다.
+            if (generation != cameraGeneration || !analysisEnabled) {
+                Log.d(TAG, "stale camera listener (gen=$generation, now=$cameraGeneration) — skip")
+                return@addListener
+            }
+            val provider = try {
+                future.get()
+            } catch (e: Exception) {
+                cameraStarting = false
+                handleCameraFailure("provider", e)
+                return@addListener
+            }
+            pendingProvider = provider
+            pendingPreviewView = pv
+            bindCameraIfReady()
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * 모델을 분석 스레드에서 연다. 결과는 메인 스레드의 [onDetectorLoaded] 로 온다.
+     * (메인 → 분석 스레드 → 메인 핸들러로 넘기므로 detector 필드의 가시성은 메시지 큐가 보장한다)
+     */
+    private fun loadDetectorInBackground() {
+        if (detectorLoading) return
+        val executor = analysisExecutor ?: return
+        detectorLoading = true
+        val appContext = applicationContext
+        try {
+            executor.execute {
+                val loaded = try {
+                    TrafficLightDetector(appContext).apply { diagnosticMode = false }
+                } catch (e: Throwable) {
+                    // Throwable — 네이티브 라이브러리 로드 실패(UnsatisfiedLinkError)나 모델 메모리 부족(OOM)은
+                    // Exception 이 아니라서, 예전 catch 로는 못 잡고 앱이 통째로 죽었다.
+                    Log.e(TAG, "Failed to load TrafficLightDetector", e)
+                    null
                 }
+                detectorHandler.post { onDetectorLoaded(loaded) }
+            }
+        } catch (_: RejectedExecutionException) {
+            detectorLoading = false   // 종료 중 — 다음 startCamera 가 다시 시도한다
+        }
+    }
+
+    private fun onDetectorLoaded(detector: TrafficLightDetector?) {
+        detectorLoading = false
+        if (isDestroyed) {
+            // onDestroy 가 이미 지나갔다 — 분석에 한 번도 쓰이지 않은 인터프리터라 여기서 닫아도 안전하다.
+            detector?.close()
+            return
+        }
+        if (detector != null) {
+            trafficLightDetector = detector
+            modelLoadFailed = false
+            Log.d(TAG, "TrafficLightDetector loaded")
+            bindCameraIfReady()
+            return
+        }
+        // 실패. 그 사이 카메라를 멈췄다면(일시정지·화면 이탈) 지금은 아무것도 하지 않는다 —
+        // 다음 startCamera 가 다시 시도하고, 그때 실패하면 그때 알린다.
+        if (!cameraStarting) return
+        pendingProvider = null
+        pendingPreviewView = null
+        cameraStarting = false
+        // 카메라를 켜 봐야 할 일이 없다 — 감시·모션 게이트까지 끈다. 안 끄면 "인식을 시작할 수 없습니다"라고
+        // 말한 뒤에도 폰을 휘두르면 "천천히 돌려 주세요"가 나와 방금 한 말과 모순이었다.
+        analysisEnabled = false
+        stopLivenessWatchdog()
+        stopAimStaleWatch()
+        motionGate?.stop()
+        aiming.stop()
+        cameraPreviewContainer.removeAllViews()
+        setKeepScreenOn(false)
+        setStatusText("모델 로드 실패")
+        // 화면 글씨만 바꾸면 시각장애인에게는 '아무 일도 안 일어남'과 구별되지 않는다.
+        // onResume 마다 재시도하며 같은 말을 반복하지 않도록 한 번만.
+        if (!modelLoadFailed) {
+            modelLoadFailed = true
+            supersedePendingIntro()
+            speakTts(crossingAware(MODEL_LOAD_FAILED_MESSAGE))
+        }
+    }
+
+    /** provider 와 모델이 **둘 다** 준비되면 바인딩한다. 어느 쪽이 먼저 끝나든 나중 쪽이 부른다. */
+    private fun bindCameraIfReady() {
+        val provider = pendingProvider ?: return
+        val pv = pendingPreviewView ?: return
+        if (detectorLoading) return
+        pendingProvider = null
+        pendingPreviewView = null
+        val generation = cameraGeneration
+        if (!analysisEnabled) {
+            cameraStarting = false
+            return
+        }
+        try {
                 cameraProvider = provider
 
                 val preview = Preview.Builder().build().also {
@@ -593,19 +746,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 val maxZoom = bound.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
                 bound.cameraControl.setZoomRatio(minOf(2.0f, maxZoom))
                 Log.d(TAG, "Camera bound (use cases: ${useCases.size})")
-            } catch (e: Exception) {
-                // 한물간 리스너의 실패는 무시한다 — 안 그러면 그 사이에 시작된
-                // 일시정지 알림이나 새 카메라 세션을 엉뚱하게 뒤엎는다.
-                if (generation != cameraGeneration) return@addListener
-                // ⚠️ 예전에는 로그만 찍고 끝이었다. 그러면 분석기가 아예 안 붙어서
-                //    onTrafficLightDetected 가 한 번도 안 불리고, 미탐지 안내 타이머조차
-                //    돌지 않는다. 사용자는 인트로 한 마디를 듣고 **영원히 침묵**을 겪는다.
-                handleCameraFailure("bind", e)
-            } finally {
-                // 한물간 리스너가 현재 진행 중인 시작의 플래그를 내리면 안 된다.
-                if (generation == cameraGeneration) cameraStarting = false
-            }
-        }, ContextCompat.getMainExecutor(this))
+        } catch (e: Exception) {
+            // ⚠️ 예전에는 로그만 찍고 끝이었다. 그러면 분석기가 아예 안 붙어서
+            //    onTrafficLightDetected 가 한 번도 안 불리고, 미탐지 안내 타이머조차
+            //    돌지 않는다. 사용자는 인트로 한 마디를 듣고 **영원히 침묵**을 겪는다.
+            // (메인 스레드에서 동기로 불리므로 그 사이 세대가 바뀔 수 없다 — 한물간 바인딩은 위에서 걸렀다)
+            handleCameraFailure("bind", e)
+        } finally {
+            cameraStarting = false
+        }
     }
 
     /**
@@ -631,7 +780,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // "방금 초록불로 바뀌었습니다. 건너세요"가 초록 진동과 함께 최신처럼 재생된다.
         announcementFromEarlierSession = true
         signalDecisionEngine.reset()
-        overlayStatusText.text = "카메라를 열 수 없음"
+        setStatusText("카메라를 열 수 없음")
+        // 인식이 멎은 채 화면만 무기한 켜 두면 배터리와 주머니 속 오작동만 남는다.
+        // (꺼지기 전까지는 소리 줄이는 버튼을 꾹 눌러 다시 켤 수 있다 — onVolumeLongPress)
+        setKeepScreenOn(false)
         // ⚠️ 소리가 안 들리는 사용자에게 vibrateWarning 을 쓰면 안 된다 — 점멸 경고와 **같은 패턴**이라
         //    촉각만 남은 사용자가 '카메라 고장'을 '신호 점멸'로 읽는다.
         //    실패는 TTS 초기화보다 먼저 날 수 있어 ttsUnavailable 이 아직 false 일 수 있으므로 ttsReady 로 본다.
@@ -644,12 +796,41 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 늦춰 둔 "신호등을 비춰 주세요" 가 이 실패 안내 뒤에 나가면 안 된다 —
         // 그게 이 세션의 마지막 말이 되어, 카메라가 죽었는데 잘 되는 줄 알게 된다.
         supersedePendingIntro()
-        speakTts(CAMERA_FAILED_MESSAGE)
+        speakTts(crossingAware(cameraFailedMessage()))
+    }
+
+    /**
+     * 카메라 실패 문구. 고온으로 기기가 카메라를 닫은 경우 "다른 앱이 쓰고 있나"는 틀린 원인이라
+     * 사용자가 할 수 없는 일을 시킨다 — 발열 상태를 보고 나눈다.
+     */
+    private fun cameraFailedMessage(): String =
+        if (thermalStatus() >= PowerManager.THERMAL_STATUS_SEVERE) CAMERA_HOT_MESSAGE else CAMERA_FAILED_MESSAGE
+
+    /** 기기 발열 단계 (API 29 미만이면 판단 불가 = 0). */
+    private fun thermalStatus(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return 0
+        return try {
+            pm.currentThermalStatus
+        } catch (_: Exception) {
+            0
+        }
     }
 
     private fun onCameraState(generation: Int, state: CameraState) {
         if (generation != cameraGeneration || !analysisEnabled) return
-        val error = state.error ?: return
+        val error = state.error
+        if (error == null) {
+            // "다른 앱이 쓰고 있다"고 알린 뒤 카메라가 풀려 CameraX 가 스스로 다시 열었다 —
+            // 예전에는 다시 켜졌다는 말이 없어, 사용자는 계속 안 되는 줄 알았다.
+            if (state.type == CameraState.Type.OPEN && cameraInUseAnnounced) {
+                // 다시 빼앗기면 그것도 알리도록 되돌린다. 건너는 중이면 "비춰 주세요"(조준 지시)는 빼고 접두를 붙인다.
+                cameraInUseAnnounced = false
+                val msg = if (inCrossingWindow()) crossingAware(CAMERA_RECOVERED_SHORT) else CAMERA_RECOVERED_MESSAGE
+                speakTrafficLight(msg, interrupt = false)
+            }
+            return
+        }
         if (error.type == CameraState.ErrorType.CRITICAL) {
             handleCameraFailure("state code=${error.code}", error.cause)
             return
@@ -660,7 +841,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (inUse && !cameraInUseAnnounced) {
             cameraInUseAnnounced = true
             aiming.stop()
-            speakTrafficLight(CAMERA_IN_USE_MESSAGE, interrupt = true)
+            speakTrafficLight(crossingAware(CAMERA_IN_USE_MESSAGE), interrupt = true)
         }
     }
 
@@ -681,7 +862,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (consecutiveFailures >= INFERENCE_FAILURES_TO_ANNOUNCE && !inferenceErrorAnnounced) {
             inferenceErrorAnnounced = true
             if (!ttsReady || volumeWarned) vibrateFatal()
-            speakTrafficLight(INFERENCE_ERROR_MESSAGE, interrupt = true, countsAsLiveness = false)
+            speakTrafficLight(crossingAware(INFERENCE_ERROR_MESSAGE), interrupt = true, countsAsLiveness = false)
         }
     }
 
@@ -693,10 +874,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 카메라가 한 번 멈추면(일시정지·백그라운드) 엔진도 리셋된다. 그 전에 들은 안내는
         // 다시 듣기 때 "방금 것"이 아니라 "조금 전 안내"로 재생돼야 한다.
         announcementFromEarlierSession = true
-        crossingUntilMs = 0L   // 엔진이 리셋되면 "건너는 중" 판단 근거도 사라진다
+        // ⚠️ crossingUntilMs 는 지우지 않는다(필드 주석) — 엔진은 리셋돼도 사용자는 아직 차도 위일 수 있다.
         // 진행 중이던 비동기 시작을 무효화하고, 다음 startCamera 가 막히지 않게 푼다.
         cameraGeneration++
         cameraStarting = false
+        // 모델이 열리길 기다리던 바인딩도 무효 — 열리면 detector 만 보관하고 바인딩은 하지 않는다.
+        pendingProvider = null
+        pendingPreviewView = null
+        confirmVibrationHandler.removeCallbacksAndMessages(null)
         camera?.cameraInfo?.cameraState?.removeObservers(this)
         try {
             cameraProvider?.unbindAll()
@@ -719,6 +904,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // stopCamera 이후 도착한 늦은 콜백 — 진동·발화를 되살리면 안 된다.
         if (!analysisEnabled) return
         lastResultAtMs = SystemClock.elapsedRealtime()
+        // 추론이 다시 결과를 낸다 = 오류에서 회복. 플래그가 남으면 나중에 멈추려고 꾹 눌렀을 때
+        // 일시정지 대신 "카메라를 다시 켭니다"가 됐다(onVolumeLongPress).
+        inferenceErrorAnnounced = false
 
         val stats = trafficLightDetector?.lastStats
 
@@ -783,6 +971,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             is SignalDecision.Repeat -> {
                 resetNoDetection()
                 lastValidatedAtMs = now
+                livenessAlarmCount = 0
                 aiming.stop()
                 // ⚠️ 다시 듣기 기록을 이 한 단어로 덮어쓰지 않는다. 예전에는 "초록불입니다. 일단 멈춰서
                 //    다음 신호를 기다리세요" 뒤 12초 반복이 기록을 "초록불"로 바꿔, 다시 듣기가 초록 진동 +
@@ -795,11 +984,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (waitingOnGreen) "기다리세요, 초록불입니다." else repeatMessage(decision.color),
                     interrupt = false,
                 )
+                // 기다리는 중(빨간불·기다릴 초록)이면, 잘렸던 조작법을 이때 짧게 채운다.
+                if (decision.color == SignalDecisionEngine.COLOR_RED || waitingOnGreen) speakOwedKeyHint()
             }
 
             is SignalDecision.Flicker -> {
                 resetNoDetection()
                 lastValidatedAtMs = now
+                livenessAlarmCount = 0
                 // 두 가지를 동시에 막는다.
                 //  (1) 경고 패턴(약 0.9초)이 조준 진동에 덮어씌워지는 것.
                 //  (2) 점멸 락아웃(엔진 6초) 동안 조준 진동이 되살아나는 것 —
@@ -823,9 +1015,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             is SignalDecision.Announce -> {
                 resetNoDetection()
                 lastValidatedAtMs = now
+                livenessAlarmCount = 0
                 aiming.holdOff(VIBRATE_SHORT_HOLD_MS)   // 판정 진동이 잘리지 않도록
                 val crossing = inCrossingWindow()
                 val transition = decision.transition
+                // 건너기 창이 열린 **뒤에** 카메라가 다시 켜졌다(일시정지·전원 키 후). 아직 차도 위일 수도, 이미 건너
+                // 다음 횡단보도 앞일 수도 있다 — 조용히 넘기면 새 횡단보도의 초록이 통째로 무음이 된다. 두 경우를 다 말한다.
+                val restartedSinceCrossing = crossing && cameraSessionStartedAtMs > crossingUntilMs - CROSSING_WINDOW_MS
+                if (restartedSinceCrossing && transition == SignalTransition.STATIC_GREEN) {
+                    rememberAnnouncement(CROSSING_GREEN_REPLAY_MESSAGE, decision.color, transition = null)
+                    // 창이 끝난 뒤 반복 안내가 "기다리세요, 초록불입니다"가 되게 — 전환을 못 본 초록이다.
+                    lastAnnouncedTransition = SignalTransition.STATIC_GREEN
+                    speakTrafficLight(CROSSING_GREEN_REPLAY_MESSAGE, interrupt = decision.interrupt)
+                    vibrateConfirmed(null)   // 주의 = "음성을 꼭 들으세요"
+                    return
+                }
                 if (crossing && transition == SignalTransition.STATIC_GREEN) {
                     // 건너는 중에 같은 초록을 다시 잡은 것(검출이 오래 끊겨 엔진이 처음부터 다시 셈).
                     // 차도 위에서 "기다리세요"라고 하면 안 된다 — 조용히 넘어간다.
@@ -839,8 +1043,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
                 val isRed = transition == SignalTransition.RED_NEW || transition == SignalTransition.GREEN_TO_RED
                 val message = when (transition) {
-                    SignalTransition.RED_NEW, SignalTransition.GREEN_TO_RED ->
-                        if (crossing) CROSSING_RED_MESSAGE else "빨간불입니다. 정지하세요."
+                    // 창 안의 '처음 본 빨간불'(카메라 재시작 뒤 등)은 "바뀌었습니다"라고 하지 않는다 — 본 적 없는 전환이다.
+                    SignalTransition.GREEN_TO_RED -> if (crossing) CROSSING_RED_MESSAGE else "빨간불입니다. 정지하세요."
+                    SignalTransition.RED_NEW -> if (crossing) CROSSING_RED_NEW_MESSAGE else "빨간불입니다. 정지하세요."
                     SignalTransition.RED_TO_GREEN -> "방금 초록불로 바뀌었습니다. 안전을 확인하고 건너세요."
                     // "기다리세요"를 맨 앞에 — 앞부분 "초록불"만 듣고 출발하지 않게.
                     SignalTransition.STATIC_GREEN -> "기다리세요. 이미 켜져 있던 초록불입니다."
@@ -855,7 +1060,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 // ⚠️ 전환(decision.vibrate)일 때만이 아니라 **모든 확정에서** 진동한다.
                 //    예전에는 RED_NEW(횡단보도 앞에서 처음 만나는 빨간불)에 진동이 없었는데,
                 //    음성이 안 들리는 상황에서는 그게 곧 "아무 일도 없었음"과 같다.
-                vibrateFor(vibrationKind)
+                vibrateConfirmed(vibrationKind)
+                if (vibrationKind == SignalTransition.RED_NEW || vibrationKind == SignalTransition.GREEN_TO_RED ||
+                    vibrationKind == SignalTransition.STATIC_GREEN
+                ) {
+                    speakOwedKeyHint()
+                }
                 Log.d(TAG, "TL announce: $message (conf=${decision.confidence})")
             }
         }
@@ -877,7 +1087,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun updateAiming() {
         // 건너는 중에는 조준 진동을 내지 않는다 — 처진 카메라가 바닥의 횡단보도 무늬를 겨눠
         // '찾았다' 2연타("멈춰요, 여기예요")가 차도 한가운데서 울렸다.
-        if (inCrossingWindow()) {
+        // 전화가 울리는 동안도 끈다 — 반복 조준 진동이 벨 진동을 끊어 전화를 놓치거나(안드로이드 12~13),
+        // 벨 진동에 묻혀 의미가 없다(14 이상). 색 확정 진동·음성은 그대로 나간다.
+        if (inCrossingWindow() || isRinging()) {
             aiming.stop()
             return
         }
@@ -934,12 +1146,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun livenessTick() {
         if (!analysisEnabled) return
         checkAudibleVolume()   // 사용자가 걷는 중에 볼륨을 내릴 수도 있다 — 매번 본다
+        checkDeviceHealth()
         val now = SystemClock.elapsedRealtime()
         // 건너는 중일 수 있는 동안은 일부러 조용하다(조준·미탐지 안내를 끔). 그 시간을 "멈춤"으로 세면
         // 창이 끝나자마자 "신호를 확인하지 못하고 있습니다"가 울린다 — 창이 끝난 시각부터 센다.
         val lastOutputAt = maxOf(lastAudibleAtMs, crossingUntilMs)
         if (lastAudibleAtMs > 0L && now - lastOutputAt >= LIVENESS_TIMEOUT_MS) {
             lastAudibleAtMs = now
+            livenessAlarmCount++
+            // 몇 번을 짚어도 회복이 없다(카메라 점유·추론 실패가 이어짐) — 화면 켠 채 45초마다 경고만 끝없이 내지 말고
+            // 알리고 멈춘다. 일시정지 재알림과 다시 켜는 법은 그대로다.
+            if (livenessAlarmCount > LIVENESS_ALARMS_BEFORE_PAUSE) {
+                pauseRecognition(LIVENESS_PAUSE_MESSAGE)
+                return
+            }
             aiming.holdOff(VIBRATE_WARNING_HOLD_MS)
             // ⚠️ 음성이 없는 상태에서 vibrateWarning 을 쓰면 안 된다 —
             //    그건 "신호가 깜빡입니다. 멈추세요" 와 **똑같은 패턴**이라,
@@ -947,10 +1167,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             //    최악의 경우 건너는 중에 그 진동을 받고 멈춰 선다.
             //    볼륨 0(volumeWarned)도 같다 — 음성이 안 들리면 촉각만 남는다.
             if (ttsUnavailable || volumeWarned) vibrateFatal() else vibrateWarning()
-            speakTrafficLight(
-                "신호를 확인하지 못하고 있습니다. 주변 소리에 주의하시고, 필요하면 뒤로 가기를 누른 뒤 신호등 카메라를 다시 켜 주세요.",
-                interrupt = false,
-            )
+            speakTrafficLight(crossingAware(LIVENESS_MESSAGE), interrupt = false)
         }
         livenessHandler.postDelayed(::livenessTick, LIVENESS_CHECK_INTERVAL_MS)
     }
@@ -969,22 +1186,104 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * 들리는 채널로 전달할 방법이 없고, 남는 건 진동뿐이다.
      */
     private fun checkAudibleVolume() {
-        val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return
-        val stream = android.media.AudioManager.STREAM_ACCESSIBILITY
+        val am = audioManager ?: return
+        val stream = AudioManager.STREAM_ACCESSIBILITY
         val level = try {
             am.getStreamVolume(stream)
         } catch (_: Exception) {
             return   // 일부 기기에서 접근성 스트림을 노출하지 않는다 — 판단 불가면 조용히 넘어간다
         }
-        val muted = level <= 0
+        // 볼륨이 있어도 **수화부로 통화 중**이면 안 들린다 — 통화 중에는 시스템이 접근성 음성을 통화 경로로
+        // 보내므로, 가슴 앞에 든 폰의 귀 쪽 스피커에서 작게 나온다. 볼륨 0 과 똑같이 진동으로만 알린다.
+        val callOnEarpiece = isCallOnEarpiece(am)
+        val muted = level <= 0 || callOnEarpiece
         if (muted && !volumeWarned) {
             volumeWarned = true
-            Log.w(TAG, "접근성 볼륨 0 — 음성 안내가 들리지 않는다")
+            mutedByCall = callOnEarpiece
+            Log.w(TAG, if (callOnEarpiece) "수화부로 통화 중 — 음성 안내가 들리지 않는다" else "접근성 볼륨 0 — 음성 안내가 들리지 않는다")
             vibrateFatal()
-            // 혹시 다른 스트림으로라도 나갈 수 있으면 나가라고 시도는 해 본다.
-            speakTts("소리가 꺼져 있어 음성 안내를 들을 수 없습니다. 소리를 키워 주세요.")
+            // 혹시 다른 스트림으로라도 나갈 수 있으면 나가라고 시도는 해 본다. (통화 중이면 말해도 귀 쪽으로만 간다)
+            if (!callOnEarpiece) speakTts("소리가 꺼져 있어 음성 안내를 들을 수 없습니다. 소리를 키워 주세요.")
         } else if (!muted) {
+            if (volumeWarned && mutedByCall) {
+                speakTrafficLight(crossingAware(CALL_ENDED_MESSAGE), interrupt = false, countsAsLiveness = false)
+            }
             volumeWarned = false
+            mutedByCall = false
+        }
+    }
+
+    /**
+     * 통화(일반·인터넷 전화) 중이고 소리가 귀 쪽 스피커로 나가는가. 권한이 필요 없는 AudioManager 만 쓴다
+     * (전화 상태 API 는 READ_PHONE_STATE 권한이 필요하다). 이어폰·스피커폰이면 들리므로 false.
+     */
+    private fun isCallOnEarpiece(am: AudioManager): Boolean {
+        val mode = try {
+            am.mode
+        } catch (_: Exception) {
+            return false
+        }
+        if (mode != AudioManager.MODE_IN_CALL && mode != AudioManager.MODE_IN_COMMUNICATION) return false
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                am.communicationDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            } else {
+                @Suppress("DEPRECATION")
+                !am.isSpeakerphoneOn && !am.isBluetoothScoOn && !am.isWiredHeadsetOn
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** 전화가 울리는 중인가 (권한 불필요). */
+    private fun isRinging(): Boolean = try {
+        audioManager?.mode == AudioManager.MODE_RINGTONE
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * 배터리·발열·절전 모드 — 한 번씩만, 건너는 중이 아닐 때 알린다(덜 급한 말은 미룬다).
+     *  - 배터리: 길 한가운데서 폰이 꺼지는 것이 보행 중 가장 큰 도구 상실이다.
+     *  - 발열: 추론이 느려지면 확정이 늦어지고, 심하면 기기가 카메라를 닫는다.
+     *  - 절전 모드: 켜진 접근성 서비스가 없으면 진동이 꺼질 수 있다(a11yAudioAttributes 주석).
+     */
+    private fun checkDeviceHealth() {
+        if (inCrossingWindow()) return
+        val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        if (bm != null) {
+            val level = try {
+                bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            } catch (_: Exception) {
+                -1
+            }
+            if (level in 1..100 && !bm.isCharging) {
+                if (level <= BATTERY_CRITICAL_PERCENT && !batteryCriticalWarned) {
+                    batteryCriticalWarned = true
+                    batteryLowWarned = true
+                    speakTrafficLight("배터리가 ${level}퍼센트 남았습니다. 곧 휴대폰이 꺼질 수 있습니다.", interrupt = false, countsAsLiveness = false)
+                    return
+                }
+                if (level <= BATTERY_LOW_PERCENT && !batteryLowWarned) {
+                    batteryLowWarned = true
+                    speakTrafficLight("배터리가 ${level}퍼센트 남았습니다.", interrupt = false, countsAsLiveness = false)
+                    return
+                }
+            }
+        }
+        if (!heatWarned && thermalStatus() >= PowerManager.THERMAL_STATUS_SEVERE) {
+            heatWarned = true
+            speakTrafficLight(HEAT_MESSAGE, interrupt = false, countsAsLiveness = false)
+            return
+        }
+        if (!powerSaveWarned) {
+            powerSaveWarned = true   // 한 번만 본다 — 켜져 있지 않으면 이 화면에서는 다시 묻지 않는다
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val a11y = getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            if (pm?.isPowerSaveMode == true && a11y?.isEnabled != true) {
+                speakTrafficLight(POWER_SAVE_MESSAGE, interrupt = false, countsAsLiveness = false)
+            }
         }
     }
 
@@ -1025,14 +1324,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     /** 신호등을 못 잡을 때 — 조용히 대기했다가 같은 문장을 간격 두고 반복. */
     private fun handleNoDetection() {
         val now = SystemClock.elapsedRealtime()
-        // 건너는 중에는 "휴대폰을 왼쪽으로" 같은 말을 하지 않는다 — 차도 위에서 걷는 방향 지시로 들린다.
-        if (now < detectStartHoldUntil || inCrossingWindow()) {
+        // 건너는 중에는 "몸을 왼쪽으로" 같은 말을 하지 않는다 — 차도 위에서 걷는 방향 지시로 들린다.
+        // 전화가 울리는 동안에도 벨소리 위로 조준 안내를 얹지 않는다.
+        if (now < detectStartHoldUntil || inCrossingWindow() || isRinging()) {
             resetNoDetection()
             return
         }
         if (noDetStartedAt == 0L) noDetStartedAt = now
         val elapsed = now - noDetStartedAt
         if (elapsed < NO_DET_FIRST_MS) return
+
+        // 오래 아무것도 못 봄 = 대개 폰을 화면 켠 채 주머니에 넣었거나 엎어 둔 것. 그대로 두면 카메라·추론이
+        // 계속 돌며 30초마다 "몸을 천천히 좌우로"가 끝없이 나오고(진짜 경고까지 흘려듣게 된다), 발열·배터리도 크다.
+        // 알리고 멈춘다 — 다시 시작하는 법을 말해 주고, 일시정지 재알림도 그대로 돈다.
+        if (elapsed >= NO_DET_AUTO_PAUSE_MS) {
+            Log.d(TAG, "no detection for ${elapsed}ms — auto pause")
+            pauseRecognition(AUTO_PAUSE_MESSAGE)
+            return
+        }
 
         if (elapsed >= NO_DET_SAFETY_MS && !noDetSafetyDone) {
             noDetSafetyDone = true
@@ -1056,12 +1365,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun crosswalkGuidanceMessage(): String {
         // lastAimTargetCenterX 가 이미 (신호등 후보 → 횡단보도) 폴백을 품고 있다.
         val cx = trafficLightDetector?.lastAimTargetCenterX ?: -1f
-        // "휴대폰을" 을 붙인다 — "왼쪽으로"만 들으면 몸을 돌리라는 건지 걸어가라는 건지 모호하다.
+        // 동사까지 말한다 — "휴대폰을 왼쪽으로"는 몸을 돌리라는 건지 걸어가라는 건지, "조금 위로"는 들어 올리라는
+        // 건지 기울이라는 건지 모호했다. 자세는 첫 안내와 같게 "가슴 앞에 세로로 들고 **몸 전체로** 돌리기".
+        // 위쪽: 화면이 내 쪽을 보게 세워 들었으니, 윗부분을 내 쪽으로 기울이면 뒤 카메라가 위를 본다.
         return when {
-            cx < 0f -> "휴대폰을 천천히 좌우로 움직여 주세요"
-            cx < 0.40f -> "휴대폰을 왼쪽으로"
-            cx > 0.60f -> "휴대폰을 오른쪽으로"
-            else -> "휴대폰을 조금 위로"
+            cx < 0f -> "몸을 천천히 좌우로 돌려 주세요"
+            cx < 0.40f -> "몸을 왼쪽으로 조금 돌려 주세요"
+            cx > 0.60f -> "몸을 오른쪽으로 조금 돌려 주세요"
+            else -> "휴대폰 윗부분을 내 쪽으로 살짝 기울여 주세요"
         }
     }
 
@@ -1080,7 +1391,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun setIdleVisual() {
         overlayColorView.setBackgroundColor(0x00000000)
-        overlayStatusText.text = "신호등을\n비춰 주세요"
+        setStatusText("신호등을\n비춰 주세요")
+    }
+
+    /**
+     * 같은 글씨면 다시 넣지 않는다. 검출 없는 프레임마다(초당 3번) 같은 문구를 넣으면, autoSize 가 걸린
+     * 고정 높이 TextView 가 매번 글자 크기를 다시 찾고 레이아웃을 새로 한다.
+     */
+    private fun setStatusText(text: String) {
+        if (overlayStatusText.text.toString() != text) overlayStatusText.text = text
     }
 
     private fun updateOverlay(decision: SignalDecision) {
@@ -1117,7 +1436,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private fun showOverlay(color: Int, text: String) {
         overlayColorView.setBackgroundColor(color)
-        overlayStatusText.text = text
+        setStatusText(text)
     }
 
     // ==================== TTS / 진동 ====================
@@ -1161,7 +1480,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 권한 창·설정 화면은 안내가 끝난 뒤에 띄운다 ([speakThen]).
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) = finished(utteranceId)
+            override fun onDone(utteranceId: String?) {
+                // 조작법을 끝까지 들었다 — 짧은 재안내는 필요 없다. (중단·오류면 남겨 둔다)
+                if (utteranceId == UTTERANCE_INTRO) introHintOwed = false
+                finished(utteranceId)
+            }
             @Suppress("OVERRIDE_DEPRECATION")   // 추상 메서드라 구현은 해야 한다
             override fun onError(utteranceId: String?) = finished(utteranceId)
             override fun onStop(utteranceId: String?, interrupted: Boolean) = finished(utteranceId)
@@ -1204,9 +1527,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // ⚠️ 일시정지 복원(회전·다크모드·프로세스 복원)이 맨 앞이어야 한다.
         //    빠지면 카메라도 엔진도 꺼진 상태에서 "신호등을 카메라에 비춰 주세요"를 말하고,
         //    정정은 30초 뒤에야 온다.
-        userPaused -> "일시정지 상태입니다. 소리 줄이는 버튼을 길게 누르면 다시 시작합니다."
+        userPaused -> "일시정지 상태입니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다."
         permissionDenied -> if (cameraPermissionBlocked) PERMISSION_BLOCKED_MESSAGE else PERMISSION_DENIED_MESSAGE
-        cameraBindFailed -> CAMERA_FAILED_MESSAGE
+        cameraBindFailed -> cameraFailedMessage()
         modelLoadFailed -> MODEL_LOAD_FAILED_MESSAGE
         // 조작법은 여기서 한 번만 알린다 — 물리 키는 알려주지 않으면 발견할 방법이 없다.
         else -> NORMAL_INTRO_MESSAGE
@@ -1243,9 +1566,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 따로 표시해 둔다 — 듣는 도중 화면을 떠나면 onPause 가 알아채고, 돌아왔을 때 다시 들려준다.
         introInFlight = true
         val message = introMessage()
+        // 신호등을 이미 향한 채 들어오면 약 1초 뒤 "빨간불입니다"가 끼어들어 조작법이 잘린다 — 그러면
+        // 다음에 기다리는 상태가 됐을 때 조작법만 짧게 다시 알린다([speakOwedKeyHint]). 끝까지 들으면 onDone 이 지운다.
+        introHintOwed = message == NORMAL_INTRO_MESSAGE
         // TalkBack 은 방금 창 제목("신호등 카메라")을 읽었다 — 같은 말로 시작하지 않는다.
         val spoken = if (message == NORMAL_INTRO_MESSAGE && Speaker.isScreenReaderOn(this)) INTRO_BODY else message
         ttsSay(spoken, TextToSpeech.QUEUE_ADD, UTTERANCE_INTRO)
+    }
+
+    /** 잘린 조작법을 짧게 다시. 기다리는 상태(빨간불·기다릴 초록)에서만 — 건너는 중에는 말을 보태지 않는다. */
+    private fun speakOwedKeyHint() {
+        if (!introHintOwed || introInFlight || inCrossingWindow()) return
+        introHintOwed = false
+        speakTrafficLight(KEY_HINT, interrupt = false, countsAsLiveness = false)
     }
 
     /**
@@ -1322,8 +1655,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     // ──────────────── 진동 ────────────────
     //
     // ⚠️ 모든 진동에 접근성 용도를 붙인다. 속성이 없으면 USAGE_UNKNOWN 으로 취급돼
-    //    **절전 모드와 시스템 진동 설정에서 통째로 억제된다.** 위 TTS 문제와 겹치면
-    //    사용자에게 남는 채널이 하나도 없다. 접근성 용도는 그 억제에서 면제된다.
+    //    **시스템 진동 설정에서 통째로 억제된다.** 위 TTS 문제와 겹치면 사용자에게 남는 채널이 하나도 없다.
+    //    단 절전 모드는 접근성 용도도 면제하지 않는다(a11yAudioAttributes 주석) — checkDeviceHealth 가 알린다.
 
     private fun vibrate(effect: VibrationEffect) {
         // ::vibrator 가드 — onInit 이 생성자에서 동기로 불리는 경로를 이중으로 막는다.
@@ -1357,8 +1690,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    /**
+     * 확정 진동을 조준 진동과 **떼어서** 울린다. 가운데 조준(20ms 톡이 150ms 간격)이 끊기자마자 짧은 펄스
+     * 세 번이 이어 붙으면 손에서는 하나로 느껴져, "가도 됨"이 "아직 조준 중"에 묻혔다.
+     * 음성은 바로 나가고 진동만 잠깐 늦는다. 그 사이 카메라가 멈추면(일시정지·화면 이탈) 울리지 않는다.
+     */
+    private fun vibrateConfirmed(kind: SignalTransition?) {
+        aiming.holdOff(CONFIRM_VIBRATION_GAP_MS + VIBRATE_SHORT_HOLD_MS)
+        confirmVibrationHandler.removeCallbacksAndMessages(null)
+        confirmVibrationHandler.postDelayed({
+            if (analysisEnabled) vibrateFor(kind)
+        }, CONFIRM_VIBRATION_GAP_MS)
+    }
+
+    /** 가도 됨 = 같은 길이 세 번. 조준 톡(20ms)과 확실히 다르게 110ms 로 길게 친다. */
     private fun vibrateGo() {
-        vibrate(VibrationEffect.createWaveform(longArrayOf(0, 70, 90, 70, 90, 70), -1))
+        vibrate(VibrationEffect.createWaveform(longArrayOf(0, 110, 100, 110, 100, 110), -1))
     }
 
     private fun vibrateWait() {
@@ -1399,32 +1746,74 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            // startTracking() 을 해야 onKeyLongPress 가 불린다.
+            // 롱프레스는 시스템 문턱(0.4~0.5초) 대신 직접 1초를 잰다(volumeKeyHandler 주석).
             if (event.repeatCount == 0) {
                 volumeLongPressHandled = false
-                event.startTracking()
+                volumeDownSeenAt = event.downTime
+                volumeKeyHandler.removeCallbacks(volumeLongPressRunnable)
+                volumeKeyHandler.postDelayed(volumeLongPressRunnable, VolumeDownRepeat.LONG_PRESS_MS)
             }
             return true   // 소비 — 볼륨은 안 내려간다
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            volumeLongPressHandled = true
-            togglePause()
-            return true
-        }
-        return super.onKeyLongPress(keyCode, event)
-    }
-
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (!volumeLongPressHandled) repeatLastAnnouncement()
+            volumeKeyHandler.removeCallbacks(volumeLongPressRunnable)
+            // DOWN 을 직접 받은 누름만 — 벨소리를 끄려고 누른 키(시스템이 DOWN 을 가져감)는 무시한다.
+            // 취소된 누름(누르는 도중 전화가 옴, TalkBack 의 두 키 동시 누름 단축키)도 다시 듣기로 치지 않는다.
+            val ownPress = volumeDownSeenAt != NO_KEY_PRESS && volumeDownSeenAt == event.downTime
+            if (ownPress && !volumeLongPressHandled && !event.isCanceled) repeatLastAnnouncement()
+            volumeDownSeenAt = NO_KEY_PRESS
             volumeLongPressHandled = false
             return true
         }
         return super.onKeyUp(keyCode, event)
+    }
+
+    /** 1초 동안 꾹 누름. 실패 상태(카메라·모델·추론 오류)면 다시 켜기, 아니면 일시정지 ↔ 재개. */
+    private fun onVolumeLongPress() {
+        if (volumeDownSeenAt == NO_KEY_PRESS) return
+        volumeLongPressHandled = true
+        // 워치독이 "꾹 눌러 다시 켜 주세요"라고 한 뒤(livenessAlarmCount > 0)도 다시 켜기다 — 문구와 동작을 맞춘다.
+        val failing = cameraBindFailed || modelLoadFailed || inferenceErrorAnnounced || livenessAlarmCount > 0
+        if (!userPaused && hasCameraPermission() && failing) {
+            restartRecognition()
+            return
+        }
+        togglePause()
+    }
+
+    /**
+     * 실패한 인식을 다시 켠다. 예전 실패 안내는 "뒤로 가기를 누른 뒤 다시 켜 주세요"였는데,
+     * 뒤로 가기가 어디 있는지 모르는 사람은 따라 할 수 없었다 — 이미 손끝에 있는 키로 바로 다시 켠다.
+     * 실패 플래그를 내려 두어, 또 실패하면 그 사실을 다시 말한다.
+     */
+    private fun restartRecognition() {
+        supersedePendingIntro()
+        speakTrafficLight("카메라를 다시 켭니다.", interrupt = true, countsAsLiveness = false)
+        aiming.holdOff(VIBRATE_SHORT_HOLD_MS)
+        vibratePauseAck(paused = false)
+        stopCamera()
+        cameraBindFailed = false
+        modelLoadFailed = false
+        startCamera()
+    }
+
+    /**
+     * 인식을 멈춘다 — 사용자의 꾹 누르기, 또는 오래 아무것도 못 본 자동 일시정지.
+     * 화면 켜 두기는 재알림이 남아 있는 동안 유지한다([resumePausedReminder]).
+     */
+    private fun pauseRecognition(message: String) {
+        userPaused = true
+        stopCamera()          // analysisEnabled=false, 워치독·모션게이트·조준진동 모두 정지
+        setIdleVisual()       // 마지막 빨강/초록 화면이 남아 동행자를 오도하지 않게
+        // ⚠️ 끼어들어 말한다. QUEUE_ADD 로 붙이면, "건너세요" 가 재생 중일 때
+        //    멈췄는데도 건너라는 안내가 몇 초 더 이어진다.
+        speakTrafficLight(crossingAware(message), interrupt = true)
+        vibratePauseAck(paused = true)
+        startPausedReminder()
     }
 
     /** 일시정지 ↔ 재개. 음성이 죽어 있어도 알 수 있도록 진동 모양을 다르게 준다. */
@@ -1442,15 +1831,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         if (!userPaused) {
-            userPaused = true
-            setKeepScreenOn(false)   // 멈춰 두고 주머니에 넣은 폰이 화면 켜진 채 남지 않게
-            stopCamera()          // analysisEnabled=false, 워치독·모션게이트·조준진동 모두 정지
-            setIdleVisual()       // 마지막 빨강/초록 화면이 남아 동행자를 오도하지 않게
-            // ⚠️ 끼어들어 말한다. QUEUE_ADD 로 붙이면, "건너세요" 가 재생 중일 때
-            //    멈췄는데도 건너라는 안내가 몇 초 더 이어진다.
-            speakTrafficLight("일시정지했습니다. 소리 줄이는 버튼을 길게 누르면 다시 시작합니다.", interrupt = true)
-            vibratePauseAck(paused = true)
-            startPausedReminder()
+            pauseRecognition("일시정지했습니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다.")
             return
         }
 
@@ -1473,7 +1854,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun requestOrOpenCameraSettings() {
         if (pendingSystemAction != null) return   // 안내가 끝나길 기다리는 중 — 연타 무시
         permissionDenied = true
-        vibrateFatal()
+        // 길게 세 번(치명)은 "휴대폰이 말을 못 한다" 전용이다 — 말을 할 수 있으면 "음성을 들으세요"(주의)로.
+        if (!ttsReady || volumeWarned) vibrateFatal() else vibrateWarning()
         if (cameraPermissionBlocked) {
             val help = if (Speaker.isScreenReaderOn(this)) "" else SETTINGS_HELP
             speakThen(OPENING_SETTINGS_MESSAGE + help) {
@@ -1490,12 +1872,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      * "앱 사용 중에만 허용 / 이번만 허용 / 허용 안함" 세 개가 세로로 있다(맨 위가 우리가 원하는 것).
      * 안드로이드 10 이하는 "거부 / 허용"이 가로로 놓인다.
      */
-    private fun permissionButtonHint(): String =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            "버튼 중 맨 위의 '앱 사용 중에만 허용'을 눌러 주세요."
-        } else {
-            "오른쪽 아래의 '허용'을 눌러 주세요."
-        }
+    private fun permissionButtonHint(): String {
+        // 권한 창 버튼은 화면 가운데쯤 떠 있어 손끝으로 찾을 기준점이 없고, 잘못 누르면 '허용 안 함'이 된다 —
+        // 설정 화면 안내처럼 도움을 청하는 길도 함께 말한다.
+        val button = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "앱 사용 중에만 허용" else "허용"
+        val where = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "버튼 중 맨 위의" else "오른쪽 아래의"
+        return "$where '$button'을 눌러 주세요. 혼자 찾기 어려우면 주변 분께 '$button'을 눌러 달라고 부탁해 주세요."
+    }
 
     /**
      * 권한 결과·설정 복귀 직후의 안내. TalkBack 이 켜져 있으면 그 순간 TalkBack 이 창 제목을 읽으므로
@@ -1535,7 +1918,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
         ttsSay(message, TextToSpeech.QUEUE_FLUSH, UTTERANCE_SYSTEM_ACTION)
-        systemActionHandler.postDelayed(::runPendingSystemAction, SYSTEM_ACTION_MAX_WAIT_MS)
+        // 상한은 문장 길이에 맞춘다 — 고정 10초면 TalkBack 없이 듣는 설정 안내(약 80음절, 13~15초)가
+        // 끝나기 전에 설정이 열려, onPause 가 "뒤로 가기를 누르면 돌아옵니다"를 잘랐다.
+        val maxWait = (message.length * SYSTEM_ACTION_MS_PER_CHAR)
+            .coerceIn(SYSTEM_ACTION_MAX_WAIT_MS, SYSTEM_ACTION_WAIT_CAP_MS)
+        systemActionHandler.postDelayed(::runPendingSystemAction, maxWait)
     }
 
     private fun runPendingSystemAction() {
@@ -1551,7 +1938,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     /**
      * 일시정지 중임을 몇 번 다시 알린다.
      *
-     * ⚠️ 롱프레스 문턱이 0.5초라, 손으로 더듬다가 **의도치 않게** 멈추기 쉽다.
+     * ⚠️ 롱프레스 문턱을 1초로 늘렸어도, 손으로 더듬다가 **의도치 않게** 멈출 수 있다.
      * 그런데 일시정지 상태에서는 워치독도 볼륨 점검도 멈추므로, 사고로 멈춘 줄 모르면
      * 그대로 영구 침묵이다 — 이 앱이 없애려던 바로 그 상태.
      *
@@ -1559,10 +1946,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
      */
     private fun pausedTick() {
         if (!userPaused) return
-        if (pausedReminderCount >= PAUSED_REMINDER_MAX) return
+        if (pausedReminderCount >= PAUSED_REMINDER_MAX) {
+            setKeepScreenOn(false)
+            return
+        }
         pausedReminderCount++
         vibratePauseAck(paused = true)
-        speakTts("일시정지 중입니다. 소리 줄이는 버튼을 길게 누르면 다시 시작합니다.")
+        speakTts("일시정지 중입니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다.")
+        if (pausedReminderCount >= PAUSED_REMINDER_MAX) {
+            // 마지막 알림 — 말이 끝날 즈음 화면을 놓아준다(바로 놓으면 화면이 꺼지며 onPause 가 말을 자른다).
+            livenessHandler.postDelayed({ if (userPaused) setKeepScreenOn(false) }, PAUSED_SCREEN_RELEASE_MS)
+            return
+        }
         livenessHandler.postDelayed(::pausedTick, PAUSED_REMINDER_MS)
     }
 
@@ -1575,8 +1970,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     /** 이미 세던 횟수를 **유지한 채** 알림만 다시 건다 (백그라운드 왕복 복구용). */
     private fun resumePausedReminder() {
         livenessHandler.removeCallbacksAndMessages(null)
-        if (pausedReminderCount >= PAUSED_REMINDER_MAX) return
-        livenessHandler.postDelayed(::pausedTick, PAUSED_REMINDER_MS)
+        if (pausedReminderCount >= PAUSED_REMINDER_MAX) {
+            setKeepScreenOn(false)
+            return
+        }
+        // ⚠️ 알림이 남은 동안은 화면을 켜 둔다. 예전에는 멈추자마자 놓아서, 시스템 화면 꺼짐 시간(15~30초)이
+        //    첫 알림(30초)보다 먼저 와 onPause 가 알림을 통째로 지웠다 — 안전망이 한 번도 안 울렸다.
+        //    첫 알림도 화면 꺼짐보다 이르게 당긴다.
+        setKeepScreenOn(true)
+        val delay = if (pausedReminderCount == 0) PAUSED_REMINDER_FIRST_MS else PAUSED_REMINDER_MS
+        livenessHandler.postDelayed(::pausedTick, delay)
     }
 
     private fun stopPausedReminder() {
@@ -1608,7 +2011,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             // 일시정지·권한 없음·카메라 실패면 그 상태부터 말한다. "아직 안내한 신호가 없습니다"만 하면
             // 인식이 돌고 있다고 오해한다.
             val state = introMessage()
-            val message = if (state == NORMAL_INTRO_MESSAGE) "아직 안내한 신호가 없습니다." else state
+            // 조작법을 놓친 사람이 누르는 것이 대개 이때다 — 사실만 말하지 말고 조작법을 다시 들려준다.
+            val message = if (state == NORMAL_INTRO_MESSAGE) "아직 안내한 신호가 없습니다. $INTRO_BODY" else state
             speakTrafficLight(message, interrupt = true, countsAsLiveness = false)
             return
         }
@@ -1663,10 +2067,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             SignalDecisionEngine.COLOR_GREEN -> "확인한 신호는 초록불이었습니다."
             else -> "신호가 깜빡였습니다."
         }
-        val now = if (userPaused) {
-            "일시정지 중이라 지금은 신호를 보고 있지 않습니다. 소리 줄이는 버튼을 길게 누르면 다시 시작합니다."
-        } else {
-            "지금 신호는 아직 확인하지 못했습니다."
+        val now = when {
+            userPaused -> "일시정지 중이라 지금은 신호를 보고 있지 않습니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다."
+            // 실패 상태면 "아직 확인 못 함"(= 인식이 돌고 있음)이 아니라 실패와 복구 방법을 말한다.
+            cameraBindFailed -> cameraFailedMessage()
+            modelLoadFailed -> MODEL_LOAD_FAILED_MESSAGE
+            else -> "지금 신호는 아직 확인하지 못했습니다."
         }
         return "$whenText $what $now"
     }
@@ -1742,8 +2148,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             //    같은 핸들러를 비우기 때문이다. 하필 영문 모르고 멈춘 사용자가 제일 먼저 하는 행동이
             //    "화면을 확인한다 / 앱을 전환한다" 라서, 정확히 그때 그물이 찢어졌다.
             //    남은 횟수는 유지한다 — 백그라운드 왕복으로 무한 잔소리를 재충전하면 안 된다.
+            resumeCueOwed = false
             resumePausedReminder()
             return
+        }
+        // 전원 키·통화·앱 전환으로 멈췄던 인식이 다시 켜진다 — 예전에는 조용히 켜져, 신호등이 안 보이면
+        // 첫 소리까지 9초 가까이 무음이었다(멈춘 건지 도는 건지 알 수 없음). 첫 안내가 다시 나갈 거면 그걸로 충분하다.
+        if (resumeCueOwed) {
+            resumeCueOwed = false
+            if (!introPending && hasCameraPermission() && !permissionDenied) {
+                vibratePauseAck(paused = false)
+                speakSettled(crossingAware(CAMERA_RESUMED_MESSAGE))
+            }
         }
         if (cameraProvider == null && hasCameraPermission()) startCamera()
     }
@@ -1758,12 +2174,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 다음 롱프레스가 (즉시 거부될) 권한 창 대신 설정 화면을 열게.
         outState.putBoolean(STATE_SENT_TO_SETTINGS, sentToSettings)
         outState.putBoolean(STATE_CAMERA_PERMISSION_BLOCKED, cameraPermissionBlocked)
+        // 건너는 중에 화면이 다시 만들어져도(다크모드 전환 등) 차도 위에서 "정지하세요"가 나오지 않게.
+        outState.putLong(STATE_CROSSING_UNTIL, crossingUntilMs)
     }
 
     override fun onPause() {
         super.onPause()
         // 키를 뗀 이벤트를 못 받고 백그라운드로 갈 수 있다. 플래그가 남으면 다음 짧은 누름이 먹힌다.
         volumeLongPressHandled = false
+        volumeKeyHandler.removeCallbacks(volumeLongPressRunnable)
+        volumeDownSeenAt = NO_KEY_PRESS
+        // 인식이 돌고 있었나 (모델을 여는 중 포함) — stopCamera 가 내리기 전에 본다.
+        val wasRecognizing = analysisEnabled || cameraStarting
+        // 모델 실패는 돌아와서 다시 시도한다 — 또 실패하면 다시 알려야 한다(화면이 꺼졌다 켜진 사람은 앞 안내를 모른다).
+        // 지금은 실패 후 감시를 다 끄므로, 이 플래그가 남으면 재시도 실패가 완전히 무음이었다.
+        modelLoadFailed = false
         // 늦춘 첫 안내가 화면을 떠난 뒤에 나가지 않게 (introPending 은 남겨 onResume 에서 다시 건다)
         introHandler.removeCallbacksAndMessages(null)
         // 안내가 끝나길 기다리던 권한 창·설정 화면 열기는 취소 — 사용자가 이미 다른 데로 갔다.
@@ -1788,10 +2213,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         // 줄여 두었던 음악·다른 앱 소리를 바로 돌려준다.
         focusHandler.removeCallbacks(releaseFocusIfIdle)
         speechFocus.release()
+
+        if (wasRecognizing && !userPaused && !isFinishing) {
+            resumeCueOwed = true
+            // 전원 키(볼륨 키 바로 옆이라 스치기 쉽다)로 화면이 꺼졌다 — 말이 중간에 끊기기만 하고 멈췄다는 확인이
+            // 없었다. 짧게 사실만 알린다(행동 지시가 아니라 큐에 남은 옛 안전 지시와는 다르다).
+            // 진동은 쓰지 않는다 — 화면이 꺼지면 시스템이 진동을 취소한다.
+            if (ttsReady && !isScreenInteractive()) {
+                ttsSay(crossingAware(SCREEN_OFF_MESSAGE), TextToSpeech.QUEUE_FLUSH, UTTERANCE_SCREEN_OFF)
+            }
+        }
     }
+
+    private fun isScreenInteractive(): Boolean =
+        (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive ?: true
 
     override fun onDestroy() {
         super.onDestroy()
+        volumeKeyHandler.removeCallbacksAndMessages(null)
+        confirmVibrationHandler.removeCallbacksAndMessages(null)
+        // detectorHandler 는 비우지 않는다 — 여는 중이던 모델이 끝나면 onDetectorLoaded 가 그걸 닫아야 한다.
         introHandler.removeCallbacksAndMessages(null)
         systemActionHandler.removeCallbacksAndMessages(null)
         settledSpeechHandler.removeCallbacksAndMessages(null)
@@ -1806,11 +2247,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         var analysisDrained = true
         analysisExecutor?.let { ex ->
             ex.shutdown()
-            analysisDrained = try {
-                ex.awaitTermination(EXECUTOR_SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                false
+            // 모델을 여는 중이면 기다리지 않는다 — 그때는 detector 가 없어 추론도 없고(닫을 것도 없고),
+            // 다 열리면 onDetectorLoaded 가 isDestroyed 를 보고 닫는다. 기다리면 회전·다크모드 전환 때
+            // 메인 스레드가 최대 1.5초 멈췄다.
+            if (!detectorLoading) {
+                analysisDrained = try {
+                    ex.awaitTermination(EXECUTOR_SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                }
             }
         }
         analysisExecutor = null
@@ -1839,18 +2285,58 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val INTRO_DELAY_WITH_SCREEN_READER_MS = 1_500L
 
         // 실패 안내는 발화 지점이 두 곳(즉시 / onInit 지연)이라 상수로 묶는다.
+        // "길게 누르면" 대신 "꾹 누르면" — 얼마나 길게인지 모호했다. 문턱은 1초([VolumeDownRepeat.LONG_PRESS_MS]).
         private const val PERMISSION_DENIED_MESSAGE =
-            "카메라 권한이 필요합니다. 소리 줄이는 버튼을 길게 누르면 권한을 다시 요청합니다."
+            "카메라 권한이 필요합니다. 소리 줄이는 버튼을 꾹 누르면 권한을 다시 요청합니다."
         private const val PERMISSION_BLOCKED_MESSAGE =
-            "카메라 권한이 꺼져 있습니다. 소리 줄이는 버튼을 길게 누르면 설정 화면을 엽니다. 권한에서 카메라를 허용해 주세요."
+            "카메라 권한이 꺼져 있습니다. 소리 줄이는 버튼을 꾹 누르면 설정 화면을 엽니다. 권한에서 카메라를 허용해 주세요."
         private const val OPENING_SETTINGS_MESSAGE =
             "설정 화면을 엽니다. 권한에서 카메라를 허용한 뒤 돌아와 주세요."
         private const val STILL_NO_PERMISSION_MESSAGE =
-            "아직 카메라 권한이 없습니다. 소리 줄이는 버튼을 길게 누르면 설정 화면을 다시 엽니다."
+            "아직 카메라 권한이 없습니다. 소리 줄이는 버튼을 꾹 누르면 설정 화면을 다시 엽니다."
+        /** "다른 앱을 닫아 주세요"는 TalkBack 없이 할 수 없는 일이었다 — 저절로 풀린다는 사실과 기다림만 말한다. */
         private const val CAMERA_IN_USE_MESSAGE =
-            "다른 앱이 카메라를 쓰고 있어 신호등을 볼 수 없습니다. 다른 앱을 닫아 주세요."
+            "다른 앱이 카메라를 쓰고 있어 신호등을 볼 수 없습니다. 주변 소리에 주의하세요. 카메라가 풀리면 저절로 다시 시작합니다."
+        private const val CAMERA_RECOVERED_MESSAGE = "카메라가 다시 켜졌습니다. 신호등을 비춰 주세요."
+        // 실패 안내는 "뒤로 가기 → 다시 켜기" 대신 손끝에 있는 키로 바로 다시 켜게 한다(onVolumeLongPress).
         private const val INFERENCE_ERROR_MESSAGE =
-            "신호등 인식에 오류가 생겼습니다. 주변 소리에 주의하시고, 뒤로 가기를 누른 뒤 신호등 카메라를 다시 켜 주세요."
+            "신호등 인식에 오류가 생겼습니다. 주변 소리에 주의하세요. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다."
+        private const val LIVENESS_MESSAGE =
+            "신호를 확인하지 못하고 있습니다. 주변 소리에 주의하세요. 계속 이러면 소리 줄이는 버튼을 꾹 눌러 카메라를 다시 켜 주세요."
+        private const val LIVENESS_PAUSE_MESSAGE =
+            "신호를 계속 확인하지 못해 일시정지했습니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다."
+
+        /** 워치독이 이만큼 연달아 울린 다음 번에 자동 일시정지 (45초 × 3 ≈ 2분 남짓). */
+        private const val LIVENESS_ALARMS_BEFORE_PAUSE = 3
+        private const val CAMERA_RECOVERED_SHORT = "카메라가 다시 켜졌습니다."
+
+        /** 건너는 중일 수 있을 때 오류·상태 안내 **앞에** 붙인다 ([crossingAware]). */
+        private const val CROSSING_KEEP_GOING = "건너는 중이면 멈추지 말고 끝까지 건너세요. "
+
+        private const val CAMERA_RESUMED_MESSAGE = "신호등 카메라를 다시 켰습니다."
+        private const val SCREEN_OFF_MESSAGE = "화면이 꺼져 신호등 안내를 멈췄습니다."
+        private const val UTTERANCE_SCREEN_OFF = "screen_off"
+        private const val CALL_ENDED_MESSAGE = "통화가 끝나 음성 안내를 다시 들을 수 있습니다."
+
+        /** 첫 안내가 잘렸을 때 기다리는 동안 짧게 채우는 조작법 ([speakOwedKeyHint]). */
+        private const val KEY_HINT = "소리 줄이는 버튼을 짧게 누르면 다시 듣기, 꾹 누르면 일시정지입니다."
+
+        private const val AUTO_PAUSE_MESSAGE =
+            "2분 동안 신호등을 찾지 못해 일시정지했습니다. 소리 줄이는 버튼을 꾹 누르면 다시 시작합니다."
+
+        /** 오래 아무것도 못 보면(대개 주머니 속) 자동 일시정지. 미탐지 안내가 4번 나간 뒤다. */
+        private const val NO_DET_AUTO_PAUSE_MS = 120_000L
+
+        private const val HEAT_MESSAGE = "휴대폰이 뜨거워져 신호 인식이 느려질 수 있습니다. 주변 소리에 더 주의하세요."
+        private const val POWER_SAVE_MESSAGE = "절전 모드라 진동 안내가 꺼질 수 있습니다."
+        private const val BATTERY_LOW_PERCENT = 15
+        private const val BATTERY_CRITICAL_PERCENT = 5
+
+        /** 조준 진동이 끊긴 뒤 확정 진동까지의 틈 — 손이 "다른 신호"로 느낄 만큼. */
+        private const val CONFIRM_VIBRATION_GAP_MS = 300L
+
+        /** 이 앱이 DOWN 을 받지 않은 볼륨 키 ([volumeDownSeenAt]). */
+        private const val NO_KEY_PRESS = Long.MIN_VALUE
 
         /** [speakThen] 의 발화 ID — 완료 콜백에서 이 발화만 골라낸다. */
         private const val UTTERANCE_SYSTEM_ACTION = "system_action"
@@ -1866,15 +2352,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         /**
          * "건너세요" 뒤 건너는 중일 수 있는 시간. 왕복 6~8차로(약 25~30m)를 천천히(0.8m/s) 건너는 시간 + 여유.
-         * 빨간불·점멸이 확정되면 바로 끝난다(문구는 그때 "끝까지 건너세요" 쪽으로 바뀐다).
+         * 빨간불·점멸이 와도, 카메라가 멈췄다 켜져도 끝나지 않는다 — 시간이 지나야 끝난다
+         * (그 사이 빨간불·점멸 문구는 "멈추지 말고 끝까지 건너세요" 쪽으로 바뀐다).
          */
         private const val CROSSING_WINDOW_MS = 40_000L
 
         /** TalkBack 이 창 제목("신호등 카메라")을 읽는 동안 기다리는 시간 — 첫 안내 지연과 같다. */
         private const val SETTLED_SPEECH_DELAY_MS = 1_500L
 
-        /** 완료 콜백이 안 와도 이만큼 지나면 권한 창·설정 화면을 연다(가장 긴 안내도 이 안에 끝난다). */
+        /**
+         * 완료 콜백이 안 와도 이만큼 지나면 권한 창·설정 화면을 연다. 최소 10초, 글자당 0.22초(띄어쓰기 포함,
+         * 기본 속도 한국어 TTS 기준 넉넉히), 최대 30초.
+         */
         private const val SYSTEM_ACTION_MAX_WAIT_MS = 10_000L
+        private const val SYSTEM_ACTION_MS_PER_CHAR = 220L
+        private const val SYSTEM_ACTION_WAIT_CAP_MS = 30_000L
 
         /** 추론이 이만큼 연속 실패하면(약 5초) 오류를 알린다. */
         private const val INFERENCE_FAILURES_TO_ANNOUNCE = 15
@@ -1886,11 +2378,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
          * ("비춰 주세요"만으로는 후면 카메라가 어디인지, 세워야 하는지 알 수 없었다)
          * TalkBack 이 켜져 있으면 TalkBack 이 창 제목("신호등 카메라")을 이미 읽으므로 첫 문장은 뺀다.
          * "볼륨 아래 버튼"은 "볼륨 버튼 밑의 버튼"으로도 들려서 "소리 줄이는 버튼"이라고 부른다.
+         *
+         * 2026-11 — 두 가지를 더 말한다.
+         *  (1) 어느 쪽이 앞인가: "화면이 내 가슴 쪽" — 뒤 카메라가 어디인지 몰라 거꾸로 드는 일이 있었다.
+         *  (2) "톡톡 두 번이면 멈추기": 색은 멈춰야 확정된다(AimingFeedback 주석). 이 규칙을 말한 적이 없어,
+         *      처음 쓰는 사람은 계속 훑다가 확정에 실패했다.
+         * 몸 전체로 돌린다 — 주변 장소 화면의 방향 찾기와 같은 자세.
          */
         private const val INTRO_TITLE = "신호등 카메라입니다. "
         private const val INTRO_BODY =
-            "휴대폰을 세로로 세워 가슴 앞에 들고, 건너편 신호등 쪽으로 천천히 돌려 주세요. " +
-                "소리 줄이는 버튼을 짧게 누르면 다시 듣기, 길게 누르면 일시정지입니다."
+            "휴대폰 화면이 내 가슴 쪽을 보게 세로로 세워 드세요. " +
+                "몸을 건너편 신호등 쪽으로 천천히 돌리다가, 톡톡 두 번 진동이 오면 멈추고 기다리세요. " +
+                "소리 줄이는 버튼을 짧게 누르면 다시 듣기, 꾹 누르면 일시정지입니다."
         private const val NORMAL_INTRO_MESSAGE = INTRO_TITLE + INTRO_BODY
 
         private const val FLICKER_MESSAGE = "신호가 깜빡입니다. 멈춰서 다음 신호를 기다리세요."
@@ -1901,6 +2400,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
          */
         private const val CROSSING_RED_MESSAGE =
             "빨간불로 바뀌었습니다. 아직 출발하지 않았다면 기다리세요. 건너는 중이면 멈추지 말고 끝까지 건너세요."
+        private const val CROSSING_RED_NEW_MESSAGE =
+            "빨간불입니다. 아직 출발하지 않았다면 기다리세요. 건너는 중이면 멈추지 말고 끝까지 건너세요."
         private const val CROSSING_FLICKER_MESSAGE =
             "신호가 깜빡입니다. 아직 출발하지 않았다면 기다리세요. 건너는 중이면 멈추지 말고 끝까지 건너세요."
         private const val CROSSING_RED_REPLAY_MESSAGE =
@@ -1916,11 +2417,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         private const val AIM_STALE_MS = 2_000L
         private const val AIM_STALE_CHECK_MS = 1_000L
         private const val CAMERA_FAILED_MESSAGE =
-            "카메라를 열 수 없습니다. 다른 앱이 카메라를 쓰고 있는지 확인하고, 뒤로 가기를 누른 뒤 신호등 카메라를 다시 켜 주세요."
+            "카메라를 열 수 없습니다. 주변 소리에 주의하세요. 소리 줄이는 버튼을 꾹 누르면 카메라를 다시 켭니다. 계속 안 되면 휴대폰을 껐다 켜 주세요."
+        private const val CAMERA_HOT_MESSAGE =
+            "휴대폰이 뜨거워 카메라를 쓸 수 없습니다. 주변 소리에 주의하세요. 그늘에서 잠시 식힌 뒤 소리 줄이는 버튼을 꾹 눌러 다시 켜 주세요."
         private const val MODEL_LOAD_FAILED_MESSAGE =
-            "신호등 인식을 시작할 수 없습니다. 뒤로 가기를 누른 뒤 신호등 카메라를 다시 켜 주세요."
+            "신호등 인식을 시작할 수 없습니다. 소리 줄이는 버튼을 꾹 누르면 다시 시도합니다."
 
-        /** 색 확정 진동(빨강 400ms / 초록 70·90·70) 보호 구간. */
+        /** 색 확정 진동(기다림 400ms / 가도 됨 110·100·110·100·110 = 530ms) 보호 구간. */
         private const val VIBRATE_SHORT_HOLD_MS = 600L
 
         /** vibrateWarning(300·120·80·120·300 = 920ms) 보호 구간. */
@@ -1950,12 +2453,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
          */
         private const val STALE_ANNOUNCEMENT_MS = 10_000L
 
-        /** 일시정지 재알림 간격과 횟수. 사고로 멈춘 경우를 잡되, 일부러 멈춘 사람은 곧 놓아준다. */
-        private const val PAUSED_REMINDER_MS = 30_000L
+        /**
+         * 일시정지 재알림 간격과 횟수. 사고로 멈춘 경우를 잡되, 일부러 멈춘 사람은 곧 놓아준다.
+         * 첫 알림은 시스템 화면 꺼짐(보통 15~30초)보다 먼저 — 8·23·38초, 그 뒤 화면을 놓아준다.
+         */
+        private const val PAUSED_REMINDER_FIRST_MS = 8_000L
+        private const val PAUSED_REMINDER_MS = 15_000L
         private const val PAUSED_REMINDER_MAX = 3
+
+        /** 마지막 재알림("일시정지 중입니다…", 약 4초)이 끝날 즈음 화면 켜 두기를 푼다. */
+        private const val PAUSED_SCREEN_RELEASE_MS = 6_000L
 
         /** 사용자가 직접 멈춘 상태인지 — 화면 회전·프로세스 복원 후에도 유지한다. */
         private const val STATE_USER_PAUSED = "userPaused"
+        private const val STATE_CROSSING_UNTIL = "crossingUntilMs"
         private const val STATE_PAUSED_REMINDER_COUNT = "pausedReminderCount"
         private const val STATE_SENT_TO_SETTINGS = "sentToSettings"
         private const val STATE_CAMERA_PERMISSION_BLOCKED = "cameraPermissionBlocked"

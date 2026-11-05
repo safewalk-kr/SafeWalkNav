@@ -1,6 +1,7 @@
 package com.example.safewalknav.nearby
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -18,6 +19,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -25,6 +27,7 @@ import androidx.core.view.AccessibilityDelegateCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.core.widget.doAfterTextChanged
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import com.example.safewalknav.BuildConfig
 import com.example.safewalknav.MainActivity
@@ -51,6 +54,7 @@ import com.example.safewalknav.navigation.nearby.NearbyResult
 import com.example.safewalknav.navigation.nearby.PointGridIndex
 import com.example.safewalknav.navigation.tmap.AddressInfo
 import com.example.safewalknav.navigation.tmap.POIResult
+import com.google.android.gms.common.api.ResolvableApiException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -161,6 +165,53 @@ class NearbyActivity : AppCompatActivity() {
 
     /** 안내를 말하던 중에 화면을 떠났다 — 돌아오면 다시 들려준다. */
     private var speechCutOff = false
+
+    /**
+     * 화면을 떠나며(전화 받음·화면 꺼짐) onPause 가 방향 찾기 진동을 멈췄다 — 돌아오면 한 번 알린다.
+     * 예전에는 말없이 멈춰서, 사용자는 아직 그쪽이 아닌 줄 알고 계속 몸을 돌렸다.
+     */
+    private var beaconInterrupted = false
+
+    /**
+     * 마지막 검색이 "위치 기능 꺼짐"으로 멈췄다. 빠른 설정에서 켜고 돌아오면(onResume·창 포커스)
+     * [다시 찾기]를 누르라고 시키지 않고 한 번 알린 뒤 바로 다시 찾는다.
+     */
+    private var locationOffFailed = false
+
+    /** 우리가 띄운 위치 켜기 창이 떠 있다 — 그동안의 onPause 는 "떠남"이 아니다(앞의 안내를 끊지 않는다). */
+    private var locationDialogShowing = false
+
+    /**
+     * 위치 설정 확인(비동기) 번호. 새 검색·창 결과가 오면 올린다 —
+     * 그 사이 끝난 옛 확인이 창을 또 띄우거나 엉뚱한 안내를 하지 않게.
+     */
+    private var locationCheckId = 0
+
+    /**
+     * 위치 켜기 창의 결과. 켰으면 곧바로 다시 찾는다(버튼을 또 누르게 하지 않는다).
+     * 닫았으면(아니요·뒤로) 켜는 다른 방법을 말한다 — 창을 다시 띄우지는 않는다(빠져나갈 수 없는 반복이 된다).
+     * 결과는 onResume 보다 먼저 온다 — 켰으면 여기서 [refresh] 가 [locationOffFailed] 를 지워,
+     * 뒤이은 onResume 의 "위치가 켜졌습니다"와 겹치지 않는다.
+     */
+    private val locationSettingsLauncher =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            locationDialogShowing = false
+            locationCheckId++
+            // 창이 떠 있는 사이 미뤄진 확인이 있었어도 버린다 — 남으면 닫은 창이 onResume 에서 또 떴다.
+            refreshOnReturn = false
+            // 아래에서 새로 말한다 — (창이 이 화면을 완전히 가려 onStop 이 끊은 경우) 옛 안내를 되살리지 않게.
+            speechCutOff = false
+            when {
+                // 자동으로 다시 찾는 검색에서는 창을 다시 띄우지 않는다 — 켰다고 했는데 아직 꺼짐으로
+                // 보이는 드문 경우에도 창이 되풀이되지 않게.
+                result.resultCode == Activity.RESULT_OK ->
+                    refresh(offerLocationDialog = false, announce = LOCATION_TURNED_ON)
+                // 창은 닫았지만 그 사이 빠른 설정으로 켰다 — "꺼져 있습니다" 뒤 곧바로 "켜졌습니다"가 이어지지 않게.
+                sampler.isLocationEnabled() ->
+                    refresh(offerLocationDialog = false, announce = LOCATION_TURNED_ON_ELSEWHERE)
+                else -> say(NearbyPhrases.LOCATION_OFF)
+            }
+        }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -301,6 +352,10 @@ class NearbyActivity : AppCompatActivity() {
         }
         val backFromCamera = leftForCamera
         leftForCamera = false
+        // 떠나 있는 사이 방향 찾기 진동이 멈췄다 — 돌아와서 하는 첫 안내에 **한 번에** 붙인다
+        // (따로 말하면 앞의 말을 끊거나 두 말이 겹친다).
+        val beaconCue = if (beaconInterrupted) NearbyPhrases.BEACON_INTERRUPTED else null
+        beaconInterrupted = false
         if (sentToSettings) {
             sentToSettings = false
             if (hasFineLocation()) {
@@ -313,21 +368,37 @@ class NearbyActivity : AppCompatActivity() {
             }
             return
         }
+        // 위치 기능이 꺼져 멈췄는데 그새 켜고 돌아왔다(빠른 설정 등) — 알리고 바로 다시 찾는다.
+        if (refreshIfLocationTurnedOn()) return
         // 돌아왔을 때 다시 찾는다 — ① 떠나며 검색을 끊었거나 ② 위치가 오래됐을 때.
         // 신호등 카메라로 길을 건너고 돌아오면 예전 박스는 수십 m 전 위치 기준이라, 누르면 엉뚱한 방향을 말한다.
         // (같은 자리면 장소 목록은 캐시에서 나와 API 비용은 거의 없다)
         val stale = fix != null && SystemClock.elapsedRealtime() - fixAtMs > STALE_FIX_ON_RETURN_MS
         if (refreshOnReturn || stale) {
+            // 위치 켜기 창은 사용자가 시작한 검색(끊겼거나 확인이 미뤄진 것)에서만 — 위치가 오래돼 알아서
+            // 다시 찾는 경우에는 아무것도 안 눌렀는데 창이 뜨지 않게 한다.
+            val offerDialog = refreshOnReturn
             refreshOnReturn = false
             speechCutOff = false   // 다시 찾으면서 새로 안내한다
-            refresh()
+            refresh(
+                offerLocationDialog = offerDialog,
+                announce = listOfNotNull(beaconCue, NearbyPhrases.SEARCHING).joinToString(" "),
+            )
             return
         }
         // 신호등 카메라에서 1분 안에 돌아옴 — 다시 찾지 않으니 예전엔 아무 말이 없어 어느 화면인지 몰랐다.
         // (카메라로 갈 때 일부러 끊은 말이라 그 말을 되살리지는 않는다)
         if (backFromCamera) {
             speechCutOff = false
-            say(RETURNED_FROM_CAMERA)
+            say(listOfNotNull(RETURNED_FROM_CAMERA, beaconCue).joinToString(" "))
+            return
+        }
+        // 진동이 멈췄다는 말이 끊긴 안내를 대신한다. 진동 중에 끊긴 말은 거의 늘 그 장소 안내
+        // ("그 장소 쪽을 향하면 진동이 울립니다")라, 되살리면 오지 않을 진동을 기다리게 한다.
+        // 장소를 다시 누르면 지금 방향과 진동이 함께 다시 나온다.
+        if (beaconCue != null) {
+            speechCutOff = false
+            say(beaconCue)
             return
         }
         // 안내(위치 설명·요약)를 듣다가 나갔다 돌아옴 — 끊긴 안내를 처음부터 다시 들려준다.
@@ -342,6 +413,29 @@ class NearbyActivity : AppCompatActivity() {
             // say() 가 아니라 speaker 로 — 같은 말을 되살리는 것이라 [freshRepeat] 를 지우지 않는다.
             if (last.isNotEmpty()) speaker.speak(last)
         }
+    }
+
+    /**
+     * 빠른 설정(위에서 끌어내리는 창)에서 위치를 켜면 대부분의 휴대폰에서 onPause/onResume 없이
+     * 창 포커스만 잃었다 돌아온다 — onResume 만 보면 바로 그 경우를 놓친다.
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) refreshIfLocationTurnedOn()
+    }
+
+    /**
+     * 위치 기능이 꺼져 검색이 멈췄는데 지금은 켜져 있다 — 한 번 알리고 바로 다시 찾는다.
+     * [다시 찾기] 버튼을 찾아 누르게 시키지 않는다. 한 번만: [refresh] 가 [locationOffFailed] 를 지운다.
+     * 위치 켜기 창이 떠 있는 동안은 그 결과([locationSettingsLauncher])가 처리한다.
+     * @return 다시 찾기를 시작했으면 true
+     */
+    private fun refreshIfLocationTurnedOn(): Boolean {
+        if (!locationOffFailed || locationDialogShowing || searching) return false
+        if (!sampler.isLocationEnabled()) return false
+        speechCutOff = false   // 다시 찾으면서 새로 안내한다
+        refresh(offerLocationDialog = false, announce = LOCATION_TURNED_ON_ELSEWHERE)
+        return true
     }
 
     /**
@@ -413,15 +507,18 @@ class NearbyActivity : AppCompatActivity() {
     /**
      * 홈 버튼·최근 앱·화면 끄기 → **즉시** 말과 검색을 멈춘다.
      * 예전에는 onStop 에서만 멈춰서, 앱 밖으로 나간 뒤에도 안내가 조금 더 이어졌다.
-     * 예외: 우리가 띄운 권한 창이 이 화면을 가린 경우(그 창을 설명하는 안내를 끊지 않게),
+     * 예외: 우리가 띄운 권한 창·위치 켜기 창이 이 화면을 가린 경우(그 창을 설명하는 안내를 끊지 않게),
      *       우리가 연 설정 화면으로 가는 경우("허용한 뒤 돌아오세요"를 끝까지).
      */
     override fun onPause() {
         super.onPause()
         // 화면을 떠나면 방향 진동도 끝 — 주머니 속에서 계속 떨면 안 된다.
+        // 켜져 있었는지 적어 두고 돌아오면 멈췄다고 알린다(onResume). 우리가 일부러 끄고 나가는
+        // 경우(신호등 카메라 버튼)는 여기 오기 전에 이미 꺼져 있어 해당하지 않는다.
+        if (::beacon.isInitialized && beacon.isRunning) beaconInterrupted = true
         stopBeacon()
         heading.stop()
-        if (!permissionDialogShowing && !sentToSettings) {
+        if (!permissionDialogShowing && !sentToSettings && !locationDialogShowing) {
             cancelSearchForLeaving()   // 남의 화면 위로 "주변 장소 N곳을 찾았습니다"가 나오지 않게
             if (speaker.isBusy()) speechCutOff = true
             speaker.stop()
@@ -506,8 +603,19 @@ class NearbyActivity : AppCompatActivity() {
 
     // ==================== 검색 ====================
 
-    private fun refresh() {
+    /**
+     * @param offerLocationDialog 위치 기능이 꺼져 있으면 켜는 창을 띄운다. 사용자가 시작한 검색만 true —
+     *   창 결과·"위치가 켜졌습니다"로 **자동으로** 다시 찾는 검색은 false(창이 되풀이되지 않게).
+     * @param announce 시작할 때 하는 말. 돌아온 이유 등을 앞에 붙여 **한 번에** 말하려고 받는다.
+     */
+    private fun refresh(offerLocationDialog: Boolean = true, announce: String = NearbyPhrases.SEARCHING) {
         if (searchJob?.isActive == true) return
+        // 위치 켜기 창이 뜨는 중·떠 있는 중 — 그 결과가 다음 일을 정한다. 창을 띄운 직후(화면이 가려지기 전)
+        // 버튼이 한 번 더 눌리면 두 번째 확인이 창을 또 띄우거나, 닫은 창이 돌아와서 다시 떴다.
+        if (locationDialogShowing) return
+        // 새 검색이 상태를 다시 판단한다 — 진행 중이던 위치 설정 확인은 무효, "위치 꺼짐" 기록도 지운다.
+        locationCheckId++
+        locationOffFailed = false
         if (!hasFineLocation()) {
             // 권한 창을 그냥 닫았던 경우 — [다시 찾기] 로 다시 물을 수 있어야 한다.
             // 영구 거부면 설정 화면을 연다.
@@ -519,14 +627,7 @@ class NearbyActivity : AppCompatActivity() {
         locationPermissionBlocked = false
         updateRefreshButton()
         if (!sampler.isLocationEnabled()) {
-            // 지난 결과를 비운다 — 남겨 두면 TalkBack 이 제목에서 옛 위치 설명을 읽고,
-            // 옛 박스를 누르면 옛 위치 기준 방향을 말한다.
-            stopBeacon()
-            clearPlaces()
-            locationContext = null
-            fix = null
-            tvAddress.text = "위치 기능 꺼짐"
-            say(NearbyPhrases.LOCATION_OFF)
+            onLocationOff(offerLocationDialog)
             return
         }
 
@@ -535,7 +636,7 @@ class NearbyActivity : AppCompatActivity() {
         clearPlaces()
         tvAddress.text = "내 위치 확인 중"
         locationContext = null   // 지난 위치 설명이 남아 읽히지 않게
-        say(NearbyPhrases.SEARCHING)
+        say(announce)
         val generation = ++searchGeneration
         setSearching(true)
 
@@ -552,6 +653,12 @@ class NearbyActivity : AppCompatActivity() {
                 val samples = sampler.sample()
                 val f = LocationFusion.fuse(samples)
                 if (f == null) {
+                    // 찾는 도중에 위치 기능이 꺼졌다 — "확인하지 못했습니다"(건물 밖으로 나가라)가 아니라
+                    // 꺼졌다고 말해야 켤 생각을 한다.
+                    if (!sampler.isLocationEnabled()) {
+                        onLocationOff(offerLocationDialog)
+                        return@launch
+                    }
                     tvAddress.text = "위치를 찾지 못함"
                     say(NearbyPhrases.LOCATION_FAILED)
                     return@launch
@@ -653,6 +760,71 @@ class NearbyActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 휴대폰의 위치 기능이 꺼져 있다(찾기 전에 확인했거나, 찾는 도중에 꺼졌다).
+     *
+     * 예전에는 "위치를 켠 뒤 다시 시도해 주세요"만 말했다 — 화면을 볼 수 없으면 빠른 설정의 위치 아이콘을
+     * 혼자 찾기 어려워 막다른 길이었다. 이제 위치를 켜는 시스템 창을 띄워 버튼 하나로 켜게 한다.
+     *  - 창은 사용자가 시작한 검색마다 한 번만([offerDialog]). 닫았는데 또 뜨면 빠져나갈 수 없다.
+     *  - 창을 띄울 수 없으면(Play 서비스 없음·해결할 수 없는 실패) 예전처럼 말로만 안내한다.
+     *  - 확인은 비동기다. 그 사이 화면을 떠났으면 남의 화면 위로 창·안내를 띄우지 않고, 돌아오면 처음부터
+     *    다시 확인한다([refreshOnReturn]).
+     */
+    private fun onLocationOff(offerDialog: Boolean) {
+        // 지난 결과를 비운다 — 남겨 두면 TalkBack 이 제목에서 옛 위치 설명을 읽고,
+        // 옛 박스를 누르면 옛 위치 기준 방향을 말한다.
+        stopBeacon()
+        clearPlaces()
+        locationContext = null
+        fix = null
+        tvAddress.text = "위치 기능 꺼짐"
+        // 빠른 설정에서 켜고 돌아오면 알아서 다시 찾는다([refreshIfLocationTurnedOn]).
+        locationOffFailed = true
+        if (!offerDialog) {
+            say(NearbyPhrases.LOCATION_OFF)
+            return
+        }
+        val checkId = locationCheckId
+        // 활동 범위 리스너(addOnCompleteListener(this))는 쓰지 않는다 — onStop 에서 떼어져, 그 사이
+        // 떠났다 돌아오면 결과가 영영 안 와 아무 말도 없다. 대신 아래에서 직접 확인한다.
+        sampler.checkLocationSettings().addOnCompleteListener { task ->
+            // 그 사이 새로 찾기 시작했거나 창 결과가 왔다 — 옛 확인으로 창을 띄우지 않는다.
+            if (checkId != locationCheckId || isFinishing || isDestroyed) return@addOnCompleteListener
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                refreshOnReturn = true
+                return@addOnCompleteListener
+            }
+            val resolvable = task.exception as? ResolvableApiException
+            when {
+                // 확인하는 사이 켜졌다
+                task.isSuccessful && sampler.isLocationEnabled() ->
+                    refresh(offerLocationDialog = false, announce = LOCATION_TURNED_ON_ELSEWHERE)
+                resolvable != null -> showLocationDialog(resolvable)
+                else -> say(NearbyPhrases.LOCATION_OFF)
+            }
+        }
+    }
+
+    /**
+     * 위치 켜기 창을 띄운다. 먼저 무엇이 뜨는지·어느 버튼인지 말한다 — 화면을 볼 수 없으면 창이 떴다는 것도
+     * 모른다. 권한 창([requestLocationPermission])과 같은 방식: 안내를 시작하고 창을 띄우되, 창이 이 화면을
+     * 가려도(onPause) 안내를 끊지 않는다([locationDialogShowing]).
+     * TalkBack 사용자도 같은 말을 듣는다 — 어느 버튼이 켜기인지 미리 알면 창 안에서 덜 헤맨다.
+     */
+    private fun showLocationDialog(e: ResolvableApiException) {
+        if (locationDialogShowing) return   // 이미 떠 있다 — 두 겹으로 띄우지 않는다
+        say(LOCATION_DIALOG_HINT)
+        locationDialogShowing = true
+        try {
+            locationSettingsLauncher.launch(IntentSenderRequest.Builder(e.resolution).build())
+        } catch (ex: Exception) {
+            // 창을 띄우지 못했다 — 말로만 안내한다.
+            Log.w(DIAG_TAG, "location settings dialog failed", ex)
+            locationDialogShowing = false
+            say(NearbyPhrases.LOCATION_OFF)
+        }
+    }
+
     private fun setSearching(on: Boolean) {
         searching = on
         updateRefreshButton()
@@ -682,6 +854,9 @@ class NearbyActivity : AppCompatActivity() {
             append(" ")
         }
         append(LAYOUT_HINT_BUTTONS)
+        // 볼륨 아래 키 다시 듣기는 TalkBack 꺼짐에서만 먹는다(VolumeDownRepeat) — 이 설명도 TalkBack 꺼짐에서만
+        // 나오므로 조건이 같다. 예전엔 이 화면 어디에서도 알려 주지 않아, 놓친 안내를 다시 들을 길을 몰랐다.
+        append(" ").append(LAYOUT_HINT_REPEAT_KEY)
     }
 
     /**
@@ -1051,7 +1226,8 @@ class NearbyActivity : AppCompatActivity() {
         private const val STILL_SEARCHING = "아직 찾고 있습니다."
         private const val STILL_SEARCHING_TAP = "아직 찾는 중입니다. 잠시만 기다려 주세요."
 
-        private const val RETURNED_FROM_CAMERA = "주변 장소 화면으로 돌아왔습니다."
+        /** 화면 이름은 제목·화면 설명과 같게 "내 위치와 주변 장소" — 이름이 다르면 다른 화면인 줄 안다. */
+        private const val RETURNED_FROM_CAMERA = "내 위치와 주변 장소 화면으로 돌아왔습니다."
 
         /** 다시 듣기로 들려줄 말이 아직 없을 때. */
         private const val SCREEN_DESCRIPTION =
@@ -1061,7 +1237,19 @@ class NearbyActivity : AppCompatActivity() {
         private const val LAYOUT_HINT_PLACES = "장소는 화면 가운데에 가까운 순서로 있습니다."
         private const val LAYOUT_HINT_MORE = "위로 밀면 더 있습니다."
         private const val LAYOUT_HINT_BUTTONS = "맨 아래 왼쪽은 다시 찾기, 오른쪽은 신호등 카메라 버튼입니다."
+        private const val LAYOUT_HINT_REPEAT_KEY = "소리 줄이는 버튼을 짧게 누르면 다시 들을 수 있습니다."
         private const val LAYOUT_HINT_MORE_THRESHOLD = 3
+
+        // 위치 기능 켜기 창 (Google 위치 설정 창 — 안드로이드 전용이라 shared 의 NearbyPhrases 가 아니라 여기에 둔다)
+        /** 창의 버튼 배치(두 개, 켜기가 오른쪽)는 LocationSampler.checkLocationSettings 의 setAlwaysShow(true) 창 기준. */
+        private const val LOCATION_DIALOG_HINT =
+            "휴대폰 위치가 꺼져 있습니다. 위치를 켜는 창을 띄웁니다. 두 버튼 중 오른쪽 버튼을 누르면 위치가 켜집니다. 혼자 찾기 어려우면 주변 분께 부탁해 주세요."
+
+        /** 창에서 켰다 — 버튼을 또 누르게 하지 않고 바로 다시 찾는다. */
+        private const val LOCATION_TURNED_ON = "위치를 켰습니다. 다시 찾습니다."
+
+        /** 창 밖(빠른 설정 등)에서 켜고 돌아왔다. */
+        private const val LOCATION_TURNED_ON_ELSEWHERE = "위치가 켜졌습니다. 다시 찾습니다."
 
         // 위치 권한 안내 (안드로이드 권한 흐름 전용이라 shared 의 NearbyPhrases 가 아니라 여기에 둔다)
         // 영구 거부일 때는 버튼 글자가 "설정 열기"다 — 안내도 그 이름으로 부른다.
@@ -1080,16 +1268,19 @@ class NearbyActivity : AppCompatActivity() {
         private const val OPENING_SETTINGS_HELP =
             " 혼자 하기 어려우면 주변 분께 SafeWalk의 위치 권한을 켜 달라고 부탁하세요. 뒤로 가기를 누르면 이 화면으로 돌아옵니다."
 
-        /** 권한 창의 버튼 중 무엇을 누를지까지 — "허용"이라는 버튼은 없고, 맨 위가 "앱 사용 중에만 허용"이다. */
         /**
          * 위치 권한 창의 실제 버튼 이름·위치. 안드로이드 10 이상은 "앱 사용 중에만 허용"이 맨 위에 세로로,
          * 9 이하는 "거부 / 허용"이 가로로 놓인다(minSdk 26 이라 둘 다 만난다).
+         * 혼자 못 찾을 때 도움을 청하는 법도 붙인다 — 부탁받은 사람이 누를 버튼 이름을 그대로 말할 수 있게.
+         * (버튼 이름이 바뀌는 경계는 앞 문장과 같은 안드로이드 10 — 두 문장이 다른 이름을 말하지 않게)
          */
         private fun permissionDialogHint(): String =
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                "곧 위치 권한을 묻는 창이 뜹니다. 버튼 중 맨 위의 '앱 사용 중에만 허용'을 눌러 주세요."
+                "곧 위치 권한을 묻는 창이 뜹니다. 버튼 중 맨 위의 '앱 사용 중에만 허용'을 눌러 주세요. " +
+                    "혼자 찾기 어려우면 주변 분께 '앱 사용 중에만 허용'을 눌러 달라고 부탁해 주세요."
             } else {
-                "곧 위치 권한을 묻는 창이 뜹니다. 오른쪽 아래의 '허용'을 눌러 주세요."
+                "곧 위치 권한을 묻는 창이 뜹니다. 오른쪽 아래의 '허용'을 눌러 주세요. " +
+                    "혼자 찾기 어려우면 주변 분께 '허용'을 눌러 달라고 부탁해 주세요."
             }
         private const val STATE_SENT_TO_SETTINGS = "sentToSettings"
         private const val STATE_PERMISSION_BLOCKED = "locationPermissionBlocked"

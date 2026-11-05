@@ -89,16 +89,20 @@
             android:autoSizeStepGranularity="2sp"
             android:textStyle="bold" />
 
+        <!--
+        [기록 공유] — 보조 버튼이라 회색(#5A5A5A, 안전 고지의 [동의하지 않음] 과 같은 색), 흰 글씨(대비 약 6.9:1).
+        예전엔 흰색이었는데, 홈·주변 장소에서 흰색은 "신호등 카메라"다 — 저시력자는 색으로 기능을 기억한다.
+        -->
         <Button
             android:id="@+id/btnBleShare"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_marginStart="12dp"
             android:layout_weight="1"
-            android:backgroundTint="#FFFFFF"
+            android:backgroundTint="#5A5A5A"
             android:maxLines="2"
             android:text="기록 공유"
-            android:textColor="#000000"
+            android:textColor="#FFFFFF"
             android:autoSizeTextType="uniform"
             android:autoSizeMinTextSize="14sp"
             android:autoSizeMaxTextSize="24sp"
