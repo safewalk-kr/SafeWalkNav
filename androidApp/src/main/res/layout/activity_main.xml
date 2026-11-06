@@ -5,13 +5,25 @@ SafeWalk — 카메라 단일 기능 화면.
 앱 실행 즉시 후방 카메라 프리뷰가 전체화면으로 뜨고, 그 위에 신호 색 오버레이 + 큰 상태
 글씨를 얹는다. 시각장애인은 화면을 안 봐도 음성·진동으로 안내받고, 저시력자/보호자/시연자는
 색과 글씨로 상태를 즉시 확인할 수 있다. (도보 내비게이션 UI 는 2026-07 제거.)
+
+⚠️ 루트에 noHideDescendants — 이 화면은 TalkBack 에게 **아무것도 노출하지 않는다.**
+
+왜: overlayStatusText 가 TalkBack 포커스 대상이었는데, 그 글씨는 의도적으로 축약된
+**시각용** 문구다("초록불"). 음성은 더 긴 문장을 말한다("초록불입니다. 일단 멈춰서 다음
+신호를 기다리세요."). TalkBack 이 그 축약본을 읽으면 **정반대 의미가 전달된다** —
+멈추라는 안내가 "초록불" 한 단어로 바뀐다. 점멸일 때는 더 심해서, 음성은 "깜빡입니다"인데
+화면 글씨는 "빨간불"이라 TalkBack 이 없는 사실을 말한다.
+
+게다가 이 화면에는 누를 것이 하나도 없다. 스크린리더가 할 일 자체가 없으므로,
+음성 채널은 앱이 온전히 소유하고 TalkBack 은 침묵하는 것이 맞다.
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="#000000"
+    android:importantForAccessibility="noHideDescendants">
 
     <!-- 후방 카메라 프리뷰 (코드에서 PreviewView 추가) -->
     <FrameLayout
@@ -29,22 +41,31 @@ SafeWalk — 카메라 단일 기능 화면.
         android:background="#00000000"
         android:importantForAccessibility="no" />
 
-    <!-- 큰 상태 글씨 (빨간불/초록불/안내). 멀리서도 보이게 그림자 + 대형. -->
+    <!--
+    큰 상태 글씨 (색 + 해야 할 행동). 저시력자·보호자용.
+     - 반투명 검정 판(#CC000000) 위에 흰 글씨: 하늘이나 초록 덧칠 위에서는 그림자만으로 대비가 1.6:1 까지
+       떨어졌다. 판 위에서는 약 14:1.
+     - 높이 고정 + 글자 크기 자동 맞춤: 52sp 고정이면 글꼴 200%·최대 화면 크기에서 "비춰 주/세요"처럼
+       글자 중간에서 끊기거나 위아래가 잘렸다. 정해진 판 안에 맞춰 줄인다.
+    -->
     <TextView
         android:id="@+id/overlayStatusText"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="220dp"
         android:layout_gravity="center"
-        android:text="신호등을 비춰 주세요"
-        android:textSize="52sp"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:background="#CC000000"
+        android:text="신호등을\n비춰 주세요"
         android:textStyle="bold"
         android:textColor="#FFFFFF"
         android:gravity="center"
-        android:padding="24dp"
-        android:shadowColor="#000000"
-        android:shadowDx="0"
-        android:shadowDy="0"
-        android:shadowRadius="16"
-        tools:text="빨간불 · 정지" />
+        android:padding="16dp"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="24sp"
+        android:autoSizeMaxTextSize="64sp"
+        android:autoSizeStepGranularity="2sp"
+        android:lineBreakWordStyle="phrase"
+        tools:text="빨간불\n정지" />
 
 </FrameLayout>

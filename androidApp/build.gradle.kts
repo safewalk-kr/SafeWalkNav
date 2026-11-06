@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.application")
@@ -20,16 +21,34 @@ val keystoreProperties = Properties().apply {
 }
 val hasReleaseSigning = keystoreProperties.getProperty("storeFile")?.isNotBlank() == true
 
+// API 키 — local.properties (gitignored) 에서 읽는다. 저장소에는 절대 올리지 않는다.
+//   TMAP_APP_KEY=...   ← 내 위치·주변 장소(역지오코딩·주변 검색)에 사용
+// 키가 없으면 빈 문자열로 빌드되고, 앱은 "설정 문제"를 음성으로 알린 뒤 그 기능만 막는다.
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+val tmapAppKey: String = localProperties.getProperty("TMAP_APP_KEY", "").trim()
+
 android {
+    // namespace(코드 패키지)는 그대로 두고, 스토어 식별자(applicationId)만 바꾼다.
+    // 둘은 독립이라 소스 파일의 package 선언을 건드릴 필요가 없다.
     namespace = "com.example.safewalknav"
-    compileSdk = 34
+    // targetSdk 36: Google Play 신규 앱 요건(2026-08-31~).
+    compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.safewalknav"
+        // ⚠️ Play 는 com.example.* 을 받지 않고, 첫 업로드 이후에는 영구히 못 바꾼다.
+        //    iOS 번들 ID(com.safewalknav.app)와 맞췄다.
+        applicationId = "com.safewalknav.app"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField("String", "TMAP_APP_KEY", "\"$tmapAppKey\"")
     }
 
     signingConfigs {
@@ -57,14 +76,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
-
     buildFeatures {
         // viewBinding 제거 (2026-06-15 정리) — *Binding 클래스 사용처 0건, 전부 findViewById.
         buildConfig = true
-        mlModelBinding = true
+        // mlModelBinding 제거 (2026-10) — ml/ 폴더 모델이 없어 생성 코드 0건. 모델은 assets 에서 직접 로드.
+    }
+}
+
+// Kotlin 2.x: android { kotlinOptions{} } 는 폐기 → kotlin { compilerOptions{} }
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_1_8)
     }
 }
 
@@ -80,30 +102,33 @@ dependencies {
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
-    // 네트워크(TMap REST/공공데이터)·GPS(play-services-location) 의존성은
-    // 2026-07 "신호등 집중" 전환으로 전면 제거됨. 현재 앱은 온디바이스 카메라/ML 만 사용.
+    // 위치 — 기능1(내 위치·주변 장소). Fused provider 가 GPS·Wi-Fi·기지국을 합쳐
+    // 도심에서 순수 GPS 보다 오차가 작다. (TMap REST 호출은 shared 의 Ktor 가 담당)
+    implementation("com.google.android.gms:play-services-location:21.3.0")
 
     // Kotlin Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0")
 
-    // ===== ML / 카메라 / 영상 처리 (PR-1: 인프라 셋업) =====
+    // ===== ML / 카메라 =====
 
-    // CameraX — 신호등 추론 / 점자블록 추적용 카메라 스트림
-    val cameraxVersion = "1.3.1"
+    // CameraX — 신호등 추론용 카메라 스트림.
+    // 1.3.1 의 libimage_processing_util_jni.so 가 4KB 정렬이라 Play 16KB 요건에 걸렸다 (readelf 확인).
+    // 1.6.x 는 내부 카메라 스택을 CameraPipe 로 통째로 바꿨으므로, 검증된 동작을 지키려고
+    // Camera2 기반 마지막 계열인 1.5.x 를 쓴다.
+    val cameraxVersion = "1.5.3"
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    // TensorFlow Lite + GPU delegate — 신호등(YOLOv8n) 추론
-    // Galaxy S25 (Adreno 830) 는 GPU delegate 풀 지원
-    // gpu-delegate-plugin 은 옛 API 사용해 lite-gpu:2.14 와 호환 안 됨 → 제외
-    // 추론 경로는 NNAPI 사용 (TrafficLightDetector 참조).
-    // tensorflow-lite-gpu 는 실사용처가 없어 제거 (2026-06-15 정리).
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    // LiteRT (구 TensorFlow Lite) — 신호등 추론.
+    // org.tensorflow:tensorflow-lite:2.14.0 의 libtensorflowlite_jni.so 가 4KB 정렬이라 교체.
+    // LiteRT 1.x 는 패키지명(org.tensorflow.lite.*)과 Interpreter API 가 그대로라 코드 변경이 없다.
+    // ⚠️ tensorflow-lite-support 는 옛 tensorflow-lite 를 끌고 들어와 4KB .so 가 다시 섞이므로 제거했다.
+    //    (유일 사용처였던 FileUtil.loadMappedFile 은 TrafficLightDetector 안에서 직접 구현)
+    implementation("com.google.ai.edge.litert:litert:1.4.0")
 
     // OpenCV 제거 (2026-06-15 정리) — 유일 사용처였던 MLCameraProbe(의존성 검증용 임시 파일) 삭제됨.
     // Room·proj4j 제거 (2026-07 정리) — 신호 공공데이터 API 폐기로 신호등 위치 로컬 캐시와

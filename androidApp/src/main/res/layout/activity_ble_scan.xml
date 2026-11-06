@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+기능3: 음향신호기 — 현재는 "현장 조사" 화면.
+
+휴대폰으로 음향신호기를 켜려면 경찰청 규격의 블루투스(BLE) 공용 프로토콜이 필요한데,
+아직 확보하지 못했다. 그 전에는 명령을 보내지 않는다(공공 교통시설에 추측으로 명령 금지).
+대신 교차로에서 주변 BLE 광고를 모아, 스마트 음향신호기가 실제로 있는지·어떤 이름/UUID 로
+광고하는지 기록해 팀에 공유한다.
+-->
+<!-- 바깥: 시스템 바 인셋만 받는다(fitsSystemWindows 는 자기 padding 을 인셋으로 덮어쓰므로
+     안쪽 여백은 한 단계 안쪽 레이아웃에 둔다). -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:fitsSystemWindows="true">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <!--
+    제목은 스크롤 안, 상태 줄은 버튼 바로 위(최대 4줄). 큰 글꼴(200%)에서 긴 권한 안내가
+    목록을 0 높이로 만들고 [다시 찾기] 를 화면 밖으로 밀어내지 않게 — activity_nearby.xml 과 같은 배치.
+    -->
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tvBleTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp"
+                android:accessibilityHeading="true"
+                android:gravity="center"
+                android:text="음향신호기 (준비 중)"
+                android:textColor="#FFFFFF"
+                android:textSize="28sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:id="@+id/bleList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </LinearLayout>
+    </ScrollView>
+
+    <TextView
+        android:id="@+id/tvBleStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:accessibilityLiveRegion="polite"
+        android:ellipsize="end"
+        android:gravity="center"
+        android:maxLines="4"
+        android:textColor="#4FC3F7"
+        android:textSize="20sp" />
+
+    <!-- 버튼 줄 96dp — 글꼴을 키우면 "다시 찾기"·"설정 열기"가 두 줄이 되는데, 80dp 에선 글자가 너무 작아졌다. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="96dp"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnBleScan"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:backgroundTint="#4FC3F7"
+            android:maxLines="2"
+            android:text="다시 찾기"
+            android:textColor="#000000"
+            android:autoSizeTextType="uniform"
+            android:autoSizeMinTextSize="14sp"
+            android:autoSizeMaxTextSize="24sp"
+            android:autoSizeStepGranularity="2sp"
+            android:textStyle="bold" />
+
+        <!--
+        [기록 공유] — 보조 버튼이라 회색(#5A5A5A, 안전 고지의 [동의하지 않음] 과 같은 색), 흰 글씨(대비 약 6.9:1).
+        예전엔 흰색이었는데, 홈·주변 장소에서 흰색은 "신호등 카메라"다 — 저시력자는 색으로 기능을 기억한다.
+        -->
+        <Button
+            android:id="@+id/btnBleShare"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="12dp"
+            android:layout_weight="1"
+            android:backgroundTint="#5A5A5A"
+            android:maxLines="2"
+            android:text="기록 공유"
+            android:textColor="#FFFFFF"
+            android:autoSizeTextType="uniform"
+            android:autoSizeMinTextSize="14sp"
+            android:autoSizeMaxTextSize="24sp"
+            android:autoSizeStepGranularity="2sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+</LinearLayout>
+</FrameLayout>

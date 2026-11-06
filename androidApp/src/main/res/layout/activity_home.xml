@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+홈: 기능 버튼 3개를 화면 세로로 3등분.
+
+- 버튼이 크고 위치가 고정이라 TalkBack 없이도 "위·가운데·아래"로 기억해 누를 수 있다.
+- 색은 서로 확연히 다르게(노랑·흰색·하늘색) — 저시력자가 색으로도 구분한다.
+- 글자는 검정 굵게 — 밝은 바탕과 대비 최대.
+- 글자 크기는 자동 맞춤(최대 40sp) — 저시력자가 시스템 글꼴을 2배로 키워도 "음향신호기"가
+  버튼 밖으로 잘리지 않는다. (고정 40sp 였을 때는 글꼴 2배에서 80sp 가 되어 잘렸다)
+fitsSystemWindows: targetSdk 35+ edge-to-edge 에서 버튼이 상태바·제스처 바에 가리지 않게.
+- 아래 버튼은 "음향신호기 (준비 중)" — 아직 신호기를 켤 수 없다(블루투스 조사만). "켜기"라고 쓰면
+  교차로에서 켜질 거라 믿고 기다리게 된다.
+-->
+<!-- 바깥: 시스템 바 인셋만 받는다(fitsSystemWindows 는 자기 padding 을 인셋으로 덮어쓰므로
+     안쪽 여백은 한 단계 안쪽 레이아웃에 둔다). -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:fitsSystemWindows="true">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <Button
+        android:id="@+id/btnNearby"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:backgroundTint="#FFD700"
+        android:contentDescription="내 위치와 주변 장소"
+        android:text="내 위치\n주변 장소"
+        android:textColor="#000000"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="16sp"
+        android:autoSizeMaxTextSize="40sp"
+        android:autoSizeStepGranularity="2sp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/btnSignal"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="12dp"
+        android:layout_weight="1"
+        android:backgroundTint="#FFFFFF"
+        android:contentDescription="신호등 카메라"
+        android:text="신호등\n카메라"
+        android:textColor="#000000"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="16sp"
+        android:autoSizeMaxTextSize="40sp"
+        android:autoSizeStepGranularity="2sp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/btnAps"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="12dp"
+        android:layout_weight="1"
+        android:backgroundTint="#4FC3F7"
+        android:contentDescription="음향신호기, 준비 중"
+        android:text="음향신호기\n(준비 중)"
+        android:textColor="#000000"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="16sp"
+        android:autoSizeMaxTextSize="40sp"
+        android:autoSizeStepGranularity="2sp"
+        android:textStyle="bold" />
+</LinearLayout>
+</FrameLayout>

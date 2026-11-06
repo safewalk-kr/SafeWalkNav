@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+앱 아이콘 바로가기 (아이콘 길게 누르기).
+
+횡단보도 앞에서 홈을 거치지 않고 신호등 카메라를 바로 켜기 위해.
+TalkBack: 아이콘에 포커스 → 두 번 탭한 채 누르고 있기(또는 작업 메뉴) → 바로가기 목록.
+
+⚠️ 모든 바로가기는 안전 고지 화면(SafetyNoticeActivity)을 거친다. 동의 전이면 고지가 먼저 나오고,
+   동의했으면 고지를 건너뛰어 홈 → 목적 화면으로 곧장 간다. 바로가기가 고지를 우회하면 안 된다.
+⚠️ targetPackage 는 applicationId 와 정확히 같아야 한다(com.safewalknav.app).
+   나중에 디버그 빌드에 applicationIdSuffix 를 붙이면 디버그에서는 바로가기가 안 열린다.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="signal_camera"
+        android:shortcutLongLabel="@string/shortcut_signal_long"
+        android:shortcutShortLabel="@string/shortcut_signal_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.safewalknav.SafetyNoticeActivity"
+            android:targetPackage="com.safewalknav.app">
+            <extra
+                android:name="com.safewalknav.extra.OPEN"
+                android:value="signal" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="nearby"
+        android:shortcutLongLabel="@string/shortcut_nearby_long"
+        android:shortcutShortLabel="@string/shortcut_nearby_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.example.safewalknav.SafetyNoticeActivity"
+            android:targetPackage="com.safewalknav.app">
+            <extra
+                android:name="com.safewalknav.extra.OPEN"
+                android:value="nearby" />
+        </intent>
+    </shortcut>
+</shortcuts>

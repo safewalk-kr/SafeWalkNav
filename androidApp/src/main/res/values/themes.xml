@@ -1,8 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.SafeWalkNav" parent="Theme.AppCompat.Light.NoActionBar">
+    <!--
+    어두운 부모 테마 (2026-10).
+     - 모든 화면 바탕이 검정인데 예전 밝은 테마는 앱을 켤 때 흰 창이 먼저 번쩍였다 — 빛에 민감한
+       저시력 사용자에게는 눈부심. windowBackground 를 검정으로 두면 시작 창(안드로이드 12+ 스플래시 포함)도 검정.
+     - 일부 기기의 "강제 다크 모드"는 밝은 테마 앱만 골라 색을 뒤집어 노랑·흰 버튼과 검정 글씨 대비를
+       바꿔 버렸다. 어두운 테마는 그 대상이 아니다.
+     - 화면의 글씨·버튼 색은 레이아웃에서 모두 직접 지정하므로 부모 테마의 기본색에 기대지 않는다.
+    -->
+    <style name="Theme.SafeWalkNav" parent="Theme.MaterialComponents.NoActionBar">
         <item name="colorPrimary">@color/primary</item>
         <item name="colorPrimaryDark">@color/primary_variant</item>
         <item name="colorAccent">@color/accent</item>
+        <item name="android:windowBackground">@android:color/black</item>
     </style>
 </resources>

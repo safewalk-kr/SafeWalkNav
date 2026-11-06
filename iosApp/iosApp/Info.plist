@@ -37,8 +37,18 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!--
+	audio: 화면이 꺼지거나 앱이 백그라운드로 가도 음성 안내가 이어지게 한다.
+	       location 만 선언돼 있으면 iOS 가 오디오 세션을 정지시켜 AVSpeechSynthesizer 가
+	       소리를 못 낸다. 그동안 FollowingController 는 백그라운드 위치로 계속 돌면서
+	       횡단보도·도착 안내를 계산해 버리고 있었다 — 계산은 하는데 들리지 않았다.
+	       시각장애인 사용자가 폰을 주머니에 넣고 걷는 건 예외가 아니라 기본 사용 방식이다.
+	       (아래 NSLocationWhenInUseUsageDescription 도 "화면이 꺼진 상태에서도 안내가
+	        이어지도록" 이라고 이미 약속하고 있다)
+	-->
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>audio</string>
 		<string>location</string>
 	</array>
 	<key>UILaunchScreen</key>

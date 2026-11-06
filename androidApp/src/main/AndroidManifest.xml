@@ -2,13 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- TTS -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- FOREGROUND_SERVICE 제거 (2026-10) — 포그라운드 서비스가 없다. Play 심사에서 사용 목적을 묻는다. -->
 
     <!-- 진동 피드백 -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- 카메라 (신호등 인식 + 점자블록/줄무늬 추적) -->
+    <!-- 기능2: 신호등 카메라 -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature
         android:name="android.hardware.camera"
@@ -17,28 +16,139 @@
         android:name="android.hardware.camera.autofocus"
         android:required="false" />
 
+    <!-- 기능1: 내 위치·주변 장소 (TMap 역지오코딩·주변 검색) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+
+    <!--
+    기능3: 음향신호기 (현재는 주변 블루투스 장치 조사용 스캔만).
+    Android 11 이하: BLUETOOTH/BLUETOOTH_ADMIN + 위치 권한.
+    Android 12 이상: BLUETOOTH_SCAN. neverForLocation 을 **붙이지 않는다** —
+      그 플래그를 달면 일부 기기가 비콘류 광고를 걸러 버려, 찾아야 할 음향신호기가 안 보일 수 있다.
+      위치 권한은 기능1 때문에 어차피 받는다.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="false" />
+
+    <!--
+    권한에서 "암시되는" 하드웨어를 선택 사항으로 명시한다. 안 적으면 Play 가
+    BLUETOOTH → android.hardware.bluetooth, 위치 권한 → android.hardware.location 을 **필수**로 보고
+    그 하드웨어가 없는 기기에 앱을 숨긴다. 이 앱은 카메라 기능만으로도 쓸 수 있다.
+    -->
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location"
+        android:required="false" />
+
+    <!--
+    TTS 엔진 조회 (Android 11+ 패키지 가시성). 이게 없으면 일부 기기에서 TextToSpeech 가
+    엔진을 못 찾아 onInit(ERROR) — TalkBack 없이 쓰는 사용자는 앱 전체가 무음이 된다.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.MaterialComponents.Light.NoActionBar"
+        android:theme="@style/Theme.SafeWalkNav"
         android:largeHeap="true"
         tools:targetApi="31"
 
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round">
 
+        <!--
+        targetSdk 36 + Android 16 은 큰 화면(폴더블 안쪽 화면·태블릿, 최소 폭 600dp 이상)에서
+        screenOrientation 을 무시한다. 아래 주석의 이유로 신호등 카메라는 세로여야 하므로,
+        허용되는 동안(targetSdk 36 까지) 그 강제를 끈다. targetSdk 37 로 올릴 때는
+        회전 대응(가로 프레임 처리)을 따로 만들어야 한다.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+            android:value="true" />
+
+        <!--
+        세로 고정. 취향이 아니라 정확성 문제다.
+
+        가로로 돌아가면 ImageAnalysis 의 rotationDegrees 가 0 이 되어 분석 프레임이
+        1280×720 가로로 들어온다. 그러면 TrafficLightDetector.preprocess 의 정사각 크롭이
+        **가로 화각을 좌우 각각 22% 씩 잘라낸다** — 사용자가 좌우로 훑는 동작의 시야가
+        44% 사라진다. 게다가 lastAimTargetCenterX 가 0.219~0.781 로 압축돼
+        AimingFeedback 의 FAR 구간(0.25 이상)에 도달할 수 없게 되고, 화면 가장자리에 있는
+        신호등에도 "잘 겨눴다"는 빠른 진동이 나간다. 시각장애인에게 거짓 신호다.
+
+        어차피 화면을 보지 않는 사용자가 폰을 돌릴 이유가 없고,
+        회전 시 Activity 재생성으로 카메라가 끊기는 것도 막는다.
+        (주변 장소 화면도 세로 고정 — 시계 방향 계산이 세로로 든 자세를 전제한다.)
+        -->
         <activity
             android:name=".SafetyNoticeActivity"
+            android:screenOrientation="portrait"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- 아이콘 길게 누르기 바로가기: 신호등 카메라 / 내 위치 (고지 게이트를 거친다) -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
+        <!-- 홈: 기능 버튼 3개 -->
+        <activity
+            android:name=".HomeActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!--
+        기능 화면 공통:
+         - singleTop: 버튼을 빠르게 두 번 누르면 같은 화면이 두 겹으로 떠서(카메라면 모델·TTS 두 벌)
+           첫 안내가 두 번 나오고, 뒤로 가면 소리 없는 두 번째 화면이 남았다.
+         - configChanges: 다크 모드 자동 전환·글꼴 크기 변경 같은 시스템 설정 변화로 화면이 다시
+           만들어지지 않게. 횡단보도 앞에서 그게 일어나면 판정 엔진이 리셋되고 모델을 다시 읽고
+           첫 안내가 또 나온다(카메라). 주변 장소는 검색을 처음부터 다시 하고 권한 창이 겹쳐 뜬다.
+        -->
+        <!-- 기능1: 내 위치·주변 장소 -->
+        <activity
+            android:name=".nearby.NearbyActivity"
+            android:configChanges="uiMode|fontScale|fontWeightAdjustment|density|screenSize|smallestScreenSize|screenLayout|orientation|keyboard|keyboardHidden|navigation|locale|layoutDirection"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!-- 기능2: 신호등 카메라 -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="uiMode|fontScale|fontWeightAdjustment|density|screenSize|smallestScreenSize|screenLayout|orientation|keyboard|keyboardHidden|navigation|locale|layoutDirection"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!-- 기능3: 음향신호기 (블루투스 조사) -->
+        <activity
+            android:name=".ble.BleScanActivity"
+            android:configChanges="uiMode|fontScale|fontWeightAdjustment|density|screenSize|smallestScreenSize|screenLayout|orientation|keyboard|keyboardHidden|navigation|locale|layoutDirection"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
             android:exported="false" />
 
     </application>

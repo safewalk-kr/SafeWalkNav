@@ -243,7 +243,11 @@ final class NavigationCoordinator: ObservableObject {
         let status = crosswalkSignalStatus[waypointIdx] ?? .noData
         let phrase: String
         switch status {
-        case .noneNearby: phrase = "신호등 없는 횡단보도입니다. 차량 소리를 확인하세요."
+        // ⚠️ 문구는 **데이터가 말하는 것**만 말한다. "신호등 없는 횡단보도입니다" 는
+        //    사실 단언인데, 근거는 2026-02 시점 서울시 목록 하나뿐이고 오탐률은 측정된 적이 없다.
+        //    신설·누락·갱신 지연이면 신호등이 있는 교차로에서 차 소리만 듣고 건너게 된다.
+        //    "확인되지 않는다" 는 틀렸을 때도 사용자를 위험한 확신으로 밀지 않는다.
+        case .noneNearby: phrase = "신호등이 확인되지 않는 횡단보도입니다. 차량 소리와 주변을 확인하세요."
         case .hasNearby, .noData: phrase = "횡단보도입니다. 신호를 확인하세요."
         }
         tts.speak(phrase, display: true)

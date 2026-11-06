@@ -1,11 +1,16 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     kotlin("multiplatform")
     id("com.android.library")
-    kotlin("plugin.serialization") version "1.9.22"
+    // 버전은 루트 build.gradle.kts 에서 관리 (Kotlin 버전과 반드시 같아야 한다)
+    kotlin("plugin.serialization")
 }
 
 // 2026-08: iOS MVP용 TMap 보행자 경로 복원 → Ktor/serialization/coroutines 재도입.
 // commonMain(Ktor core+json) / androidMain(okhttp) / iosMain(darwin) 엔진 분리.
+// 2026-10: Kotlin 2.2.21 / compileSdk 36 로 업그레이드. 라이브러리 버전은 그대로 둔다
+//          (Android 쪽 변경을 최소화하기 위함 — iOS 빌드는 Mac 에서 별도 확인 필요).
 
 val ktorVersion = "2.3.7"
 val kotlinxSerializationVersion = "1.6.2"
@@ -15,10 +20,9 @@ val isRunningOnMac = System.getProperty("os.name").orEmpty().startsWith("Mac")
 
 kotlin {
     androidTarget {
-        compilations.all {
-            kotlinOptions {
-                jvmTarget = "1.8"
-            }
+        // Kotlin 2.x: kotlinOptions{} 는 폐기 → compilerOptions{}
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
 
@@ -60,7 +64,7 @@ kotlin {
 
 android {
     namespace = "com.example.safewalknav.shared"
-    compileSdk = 34
+    compileSdk = 36
     defaultConfig {
         minSdk = 26
     }

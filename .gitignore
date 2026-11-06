@@ -1,12 +1,16 @@
 # ===== Android / Gradle =====
 *.iml
 .gradle/
+# Kotlin 2.x 가 프로젝트 루트에 만드는 캐시 디렉터리
+.kotlin/
 build/
 /local.properties
 captures/
 .externalNativeBuild/
 .cxx/
-release/
+# 서명된 APK/AAB 출력 위치만 막는다. 앵커 없는 release/ 는 src/release/(릴리스 전용 소스)까지 숨긴다.
+/release/
+/androidApp/release/
 
 # build.gradle.kts에서 리다이렉트한 빌드 출력 (참고용 — 프로젝트 외부라 보통 무관)
 # C:/SafeWalkBuild/

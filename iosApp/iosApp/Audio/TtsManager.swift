@@ -30,7 +30,15 @@ final class TtsManager: NSObject, ObservableObject {
     @Published private(set) var displayText: String = ""
 
     // MARK: - Private Properties
-    private let synthesizer = AVSpeechSynthesizer()
+    /// ⚠️ `var` 인 이유: mediaServicesWereReset(오디오 데몬 재시작) 시 인스턴스 자체가
+    /// 무효가 되므로 새로 만들어야 한다. 그 외에는 재할당하지 않는다.
+    private var synthesizer = AVSpeechSynthesizer()
+
+    /// 오디오 세션 알림 구독 토큰. 블록 기반 addObserver 는 self 가 아니라 이 토큰에 묶인다.
+    private var sessionObservers: [NSObjectProtocol] = []
+
+    /// 직전 세션 확보 실패 메시지. 같은 실패를 매 발화마다 로그로 찍지 않기 위한 것.
+    private var lastSessionError: String?
 
     /// 직전에 말한 텍스트 (중복 방지용)
     private var lastSpokenText: String = ""
@@ -45,12 +53,27 @@ final class TtsManager: NSObject, ObservableObject {
     override init() {
         super.init()
         synthesizer.delegate = self
-        configureAudioSession()
+        ensurePlaybackSession(reason: "init")
+        observeSessionDisruptions()
     }
 
-    // MARK: - Audio Session 설정
-    /// 다른 앱 소리(예: 음악)와 섞여서 재생되도록 설정
-    private func configureAudioSession() {
+    deinit {
+        // ⚠️ 블록 기반 addObserver 는 self 가 아니라 **토큰**에 등록된다.
+        //    removeObserver(self) 로는 지워지지 않으므로 토큰을 들고 있다가 해제한다.
+        sessionObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    // MARK: - Audio Session
+
+    /// **말할 수 있는 상태**로 세션을 보장한다. 설정·복구가 한 함수다.
+    ///
+    /// ⚠️ `setActive(true)` 만으로는 부족하다. 카테고리까지 다시 걸어야 한다 —
+    /// [SttManager] 가 마이크를 열 때 세션을 `.record/.measurement` 로 바꾸는데,
+    /// 시작 실패 경로에서는 `.playback` 으로 되돌리지 못하고 빠져나간다.
+    /// `.record` 인 세션에서 `AVSpeechSynthesizer` 는 **소리를 내지 않는다.**
+    /// 그리고 `synthesizer.speak` 는 던지지도 않으므로 실패가 드러나지도 않는다.
+    /// 말하려는 시점에는 언제나 `.playback` 이어야 한다.
+    private func ensurePlaybackSession(reason: String) {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(
@@ -59,9 +82,74 @@ final class TtsManager: NSObject, ObservableObject {
                 options: [.mixWithOthers, .duckOthers]
             )
             try session.setActive(true)
+            lastSessionError = nil
         } catch {
-            print("[TtsManager] 오디오 세션 설정 실패: \(error)")
+            // 매 발화(12초 heartbeat 등)마다 같은 실패를 찍지 않는다 —
+            // 화면 꺼진 채 걷는 동안 로그가 계속 쌓인다.
+            let desc = error.localizedDescription
+            if lastSessionError != desc {
+                lastSessionError = desc
+                print("[TtsManager] 오디오 세션 확보 실패(\(reason)): \(desc)")
+            }
         }
+    }
+
+    /// 놓친 안내가 중복 필터에 막히지 않도록 dedup 상태를 비운다.
+    /// 인터럽션으로 삼켜진 발화를 호출자가 곧바로 재시도할 때 필요하다.
+    private func clearDedup() {
+        lastSpokenText = ""
+        lastSpeakTime = .distantPast
+    }
+
+    /// 오디오 세션이 뺏겼다가 돌아왔을 때 되살린다.
+    ///
+    /// ⚠️ 이게 없으면 **전화 한 통으로 남은 보행 내내 안내가 사라진다.**
+    /// 전화·Siri·다른 앱이 세션을 가져가면 iOS 가 우리 세션을 비활성화하는데,
+    /// 예전에는 init 에서 딱 한 번 setActive(true) 하고 끝이라 되살릴 주체가 없었다.
+    /// `synthesizer.speak` 는 던지지도 않고 조용히 삼키므로 **실패가 드러나지도 않는다.**
+    /// 폰을 주머니에 넣고 걷는 사용자에게는 화면의 displayText 도 대안이 못 된다.
+    ///
+    /// mediaServicesWereReset 은 오디오 데몬이 재시작된 경우로,
+    /// 이때는 세션뿐 아니라 합성기 인스턴스까지 무효가 되므로 새로 만든다.
+    private func observeSessionDisruptions() {
+        let center = NotificationCenter.default
+
+        let onInterruption = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main,
+            using: { [weak self] note in
+                guard
+                    let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                    let type = AVAudioSession.InterruptionType(rawValue: raw),
+                    type == .ended
+                else { return }
+                guard let self else { return }
+                // .shouldResume 은 일부러 보지 않는다. 그건 '미디어 재생을 이어갈까'라는
+                // 힌트이고, 보행 안내는 미디어가 아니다. 횡단보도 앞에 선 사용자에게는
+                // 끼어든 앱의 의사와 무관하게 세션이 돌아와야 한다.
+                self.ensurePlaybackSession(reason: "interruption ended")
+                self.clearDedup()
+            }
+        )
+
+        let onReset = center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main,
+            using: { [weak self] _ in
+                guard let self else { return }
+                // 옛 합성기는 didFinish 를 영영 안 보내므로 isSpeaking 을 직접 내린다.
+                self.isSpeaking = false
+                self.synthesizer = AVSpeechSynthesizer()
+                self.synthesizer.delegate = self
+                self.ensurePlaybackSession(reason: "mediaServicesWereReset")
+                self.clearDedup()
+                print("[TtsManager] mediaServicesWereReset — 합성기·세션 재생성")
+            }
+        )
+
+        sessionObservers = [onInterruption, onReset]
     }
 
     // MARK: - Public API
@@ -89,6 +177,10 @@ final class TtsManager: NSObject, ObservableObject {
         //    AVSpeechSynthesizer 는 직전 utterance 의 didFinish 후에야 다음 utterance 를 시작하므로
         //    멘트가 중간에 잘리지 않는다. priority 인자는 호환을 위해 남기되 끊지 않는다.
         //    (자기 목소리가 마이크로 들어가는 걸 막아야 하는 STT 진입 등은 명시적 stop() 사용)
+
+        // 3-1. 방어적 재활성화 — 인터럽션 알림을 놓쳤거나 STT 가 세션을 .record 로
+        //      바꿔둔 채 돌려주지 못한 경우에도 여기서 복구된다. 이미 활성이면 사실상 무비용.
+        ensurePlaybackSession(reason: "speak")
 
         // 4. 발화 — 표시 플래그를 utterance 에 실어 보내 didStart 시점에 화면 갱신.
         let utterance = DisplayUtterance(string: text)
@@ -120,6 +212,9 @@ final class TtsManager: NSObject, ObservableObject {
 
         // 큐 전체 비우기 — 대기 중인 횡단보도 등 안내가 있으면 함께 사라진다.
         synthesizer.stopSpeaking(at: .immediate)
+
+        // 도착·점멸 같은 즉시 안내일수록 세션이 죽어 있으면 안 된다.
+        ensurePlaybackSession(reason: "speakImmediately")
 
         let utterance = DisplayUtterance(string: text)
         utterance.shouldDisplay = display

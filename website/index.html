@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SafeWalk — 시각장애인 보행 안내 앱</title>
+<meta name="description" content="시각장애인이 스마트폰만으로 횡단보도를 건널 수 있도록 돕는 보행 안내 앱입니다. 음성 목적지 입력, 보행 경로 음성 안내, 신호등 인식을 제공합니다.">
+<meta property="og:title" content="SafeWalk — 시각장애인 보행 안내 앱">
+<meta property="og:description" content="시각장애인이 스마트폰만으로 횡단보도를 건널 수 있도록 돕는 보행 안내 앱입니다.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://safewalk-kr.github.io/">
+<meta property="og:image" content="https://safewalk-kr.github.io/images/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0E1C33">
+<style>
+  :root {
+    --surface: #FFFFFF; --bg: #EAEDF2; --ink: #14171C; --muted: #565D68; --line: #D3D7DE;
+    --deep: #0E1C33; --deep-lift: #17294A; --on-deep: #FFFFFF; --on-deep-mut: #A9B6CC;
+    --on-deep-link:#8FB4FF; --deep-line: rgba(255,255,255,0.16);
+    --accent: #1749B3; --signal: #F0A202; --caution-bg: #FFF7E6;
+    --font: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--surface); color: var(--ink); font-family: var(--font); font-size: 1.125rem; line-height: 1.75; word-break: keep-all; }
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.5rem; }
+  .skip { position: absolute; left: -9999px; top: 0; background: var(--ink); color: #fff; padding: 0.75rem 1.25rem; z-index: 10; }
+  .skip:focus { left: 0; }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+  .band { background: var(--surface); }
+  .band--tint { background: var(--bg); }
+  .band--deep { background: var(--deep); color: var(--on-deep); }
+  .band--deep a { color: var(--on-deep-link); }
+  .band--deep a:focus-visible { outline-color: var(--signal); }
+  .band--deep .eyebrow, .band--deep .voice-label { color: var(--on-deep-mut); }
+  section { padding: clamp(3rem, 8vw, 4.5rem) 0; }
+  .band > section + section { padding-top: 0; }
+  .eyebrow { font-size: 0.875rem; font-weight: 700; letter-spacing: 0.14em; color: var(--muted); margin: 0 0 1.25rem; }
+  h1 { font-size: clamp(2.75rem, 11vw, 4.25rem); font-weight: 800; letter-spacing: -0.035em; line-height: 1.05; margin: 0 0 1.5rem; }
+  h2 { font-size: clamp(1.5rem, 5vw, 1.875rem); font-weight: 700; letter-spacing: -0.02em; line-height: 1.35; margin: 0 0 1.25rem; }
+  h3 { font-size: 1.1875rem; font-weight: 700; margin: 0 0 0.5rem; }
+  p { margin: 0 0 1.25rem; }
+  p:last-child { margin-bottom: 0; }
+  .lead { font-size: clamp(1.25rem, 4vw, 1.4375rem); line-height: 1.6; }
+  .hero { padding: 4.5rem 0 4rem; background: radial-gradient(115% 85% at 12% 0%, var(--deep-lift) 0%, var(--deep) 62%); }
+  .hero .lead { color: #E4E9F2; }
+  .voice { margin: 3rem 0 0; padding: 0; list-style: none; }
+  .voice li { border-left: 4px solid var(--signal); padding: 0.25rem 0 0.25rem 1.25rem; margin: 0 0 1.5rem; font-size: clamp(1.375rem, 5.5vw, 1.75rem); font-weight: 600; letter-spacing: -0.02em; line-height: 1.4; }
+  .voice li:last-child { margin-bottom: 0; }
+  .voice-label { font-size: 0.875rem; font-weight: 700; letter-spacing: 0.14em; color: var(--muted); margin: 0 0 1.25rem; }
+  .divider { padding: 2.75rem 0; background: var(--surface); }
+  .divider--tint { background: var(--bg); }
+  .crosswalk { height: 0.75rem; background-image: repeating-linear-gradient(90deg, var(--signal) 0 1rem, transparent 1rem 2rem); }
+  .stats { margin: 0 0 2rem; }
+  .stat-block { margin: 0 0 2.5rem; padding-left: 1.25rem; border-left: 4px solid var(--signal); }
+  .stat-block:last-child { margin-bottom: 0; }
+  .stat { font-size: clamp(2.5rem, 10vw, 3.25rem); font-weight: 800; letter-spacing: -0.03em; line-height: 1.1; color: var(--accent); display: block; }
+  .stat-label { font-size: 1.0625rem; font-weight: 600; margin: 0.5rem 0 0.75rem; }
+  .stat-block p:not(.stat-label) { color: var(--muted); font-size: 1.0625rem; margin: 0; }
+  .sr-heading { font-size: 0.875rem; font-weight: 700; letter-spacing: 0.14em; color: var(--muted); margin: 2.5rem 0 0; }
+  .sources { list-style: none; margin: 0.75rem 0 0; padding: 0; font-size: 0.9375rem; line-height: 1.65; color: var(--muted); }
+  .sources li { margin-bottom: 0.5rem; }
+  .sources li:last-child { margin-bottom: 0; }
+  .features { list-style: none; margin: 0; padding: 0; display: grid; gap: 1rem; }
+  .features li { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 0.5rem; padding: 1.5rem 1.375rem; }
+  .features p { margin: 0; color: var(--muted); font-size: 1.0625rem; }
+
+  /* ---------- 스크린샷 갤러리 (자동 왕복 스크롤) ---------- */
+  .shots-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+  .shots-head h2 { margin-bottom: 0; }
+  .shots-toggle { flex: 0 0 auto; font: inherit; font-size: 0.9375rem; font-weight: 600; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 999px; padding: 0.35rem 0.95rem; cursor: pointer; }
+  .shots-toggle[hidden] { display: none; }
+  .marquee { margin: 1.75rem 0 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%); }
+  .marquee::-webkit-scrollbar { display: none; }
+  .marquee__track { display: flex; gap: 1.25rem; width: max-content; margin: 0 auto; padding: 0 1.5rem; }
+  .marquee figure { flex: 0 0 auto; width: 230px; margin: 0; }
+  .marquee img { width: 100%; height: auto; display: block; border: 1px solid var(--line); border-radius: 1.25rem; background: #000; }
+  .marquee figcaption { margin-top: 0.75rem; text-align: center; font-size: 0.95rem; color: var(--muted); line-height: 1.4; }
+  @media (prefers-reduced-motion: reduce) { .shots-toggle { display: none; } }
+
+  /* ---------- CTA 버튼 ---------- */
+  .cta { display: inline-block; margin-top: 0.5rem; background: var(--accent); color: #fff; font-weight: 700; font-size: 1.0625rem; padding: 0.9rem 1.6rem; border-radius: 0.6rem; text-decoration: none; }
+  .cta:hover { filter: brightness(1.1); }
+
+  .video { position: relative; padding-top: 56.25%; background: #000; border: 1px solid var(--deep-line); border-radius: 0.5rem; overflow: hidden; }
+  .video iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .video-alt { font-size: 1rem; color: var(--on-deep-mut); margin-top: 1rem; }
+  .notice { background: var(--caution-bg); border: 1px solid #F0D9A8; border-left: 6px solid var(--signal); border-radius: 0.5rem; padding: 1.75rem; }
+  .notice h2 { font-size: 1.25rem; margin-bottom: 0.75rem; }
+  .notice p { font-size: 1.0625rem; margin-bottom: 0.75rem; }
+  .team { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+  .team li { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; justify-content: space-between; align-items: baseline; padding: 1rem 0; border-bottom: 1px solid var(--line); }
+  .team .name { font-weight: 700; }
+  .team .role { color: var(--muted); font-size: 1rem; }
+  .support { background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 1.75rem; }
+  .support p { font-size: 1.0625rem; margin: 0; }
+  .contact-mail { display: inline-block; font-size: clamp(1.1875rem, 4.5vw, 1.5rem); font-weight: 700; letter-spacing: -0.01em; margin-top: 0.5rem; word-break: break-all; }
+  footer { padding: 2.5rem 0 4rem; font-size: 1rem; color: var(--on-deep-mut); }
+  .footer-links { list-style: none; margin: 0 0 1.5rem; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem 1.75rem; }
+  @media (min-width: 48rem) {
+    .features { grid-template-columns: repeat(3, 1fr); }
+    .hero { padding: 6.5rem 0 5rem; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+    .stat-block { margin-bottom: 0; }
+  }
+  @media (forced-colors: active) {
+    .features li, .notice, .support { border: 1px solid CanvasText; }
+    .crosswalk { forced-color-adjust: none; }
+  }
+  .js [data-reveal] { opacity: 0; transform: translateY(1.25rem); transition: opacity 0.7s ease-out, transform 0.7s ease-out; }
+  .js [data-reveal].is-visible { opacity: 1; transform: none; }
+  .js .features li[data-reveal]:nth-child(2) { transition-delay: 0.12s; }
+  .js .features li[data-reveal]:nth-child(3) { transition-delay: 0.24s; }
+  .js .stat-block[data-reveal]:nth-of-type(2) { transition-delay: 0.14s; }
+  .js .crosswalk[data-reveal] { opacity: 1; transform: none; background-repeat: no-repeat; background-size: 0% 100%; transition: background-size 0.9s ease-out; }
+  .js .crosswalk[data-reveal].is-visible { background-size: 100% 100%; }
+  @media (prefers-reduced-motion: no-preference) {
+    .fade { animation: rise 0.6s ease-out both; }
+    .fade:nth-of-type(2) { animation-delay: 0.08s; }
+    .fade:nth-of-type(3) { animation-delay: 0.16s; }
+    @keyframes rise { from { opacity: 0; transform: translateY(0.75rem); } to { opacity: 1; transform: none; } }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .js [data-reveal], .js .crosswalk[data-reveal] { opacity: 1; transform: none; background-size: 100% 100%; transition: none; }
+  }
+</style>
+<script>document.documentElement.className += " js";</script>
+</head>
+
+<body>
+<a class="skip" href="#main">본문으로 건너뛰기</a>
+
+<header class="hero band band--deep">
+  <div class="wrap">
+    <p class="eyebrow">동국대학교 공개SW프로젝트</p>
+    <h1>SafeWalk</h1>
+    <p class="lead">시각장애인이 스마트폰만으로 횡단보도를 건널 수 있도록 돕는 보행 안내 앱입니다.</p>
+    <p class="voice-label">앱이 사용자에게 들려주는 안내</p>
+    <ul class="voice">
+      <li class="fade">“목적지까지 1,471미터. 횡단보도 3개.”</li>
+      <li class="fade">“빨간불입니다. 정지하세요.”</li>
+    </ul>
+  </div>
+</header>
+
+<div class="divider"><div class="crosswalk" data-reveal aria-hidden="true"></div></div>
+
+<main id="main">
+
+  <div class="band">
+    <section id="problem" data-reveal>
+      <div class="wrap">
+        <h2>혼자 걷는다는 것</h2>
+        <p>국내 시각장애인은 약 24만 7천 명입니다. 이들이 혼자 길을 나설 때 마주하는 문제는 크게 두 가지입니다.</p>
+        <div class="stats">
+          <div class="stat-block" data-reveal>
+            <span class="stat">57%</span>
+            <p class="stat-label">혼자 보행하는 시각장애인이 주 1회 이상 길을 잃는 비율</p>
+            <p>길을 잃은 뒤 다시 경로로 돌아오는 일이 특히 어렵습니다.</p>
+          </div>
+          <div class="stat-block" data-reveal>
+            <span class="stat">45.3%</span>
+            <p class="stat-label">조사 대상 공공시설 중 음향신호기가 설치되지 않은 비율</p>
+            <p>음향신호기가 없는 횡단보도에서는 신호가 언제 바뀌는지 알 수 없는 상태로 길을 건너야 합니다.</p>
+          </div>
+        </div>
+        <p>기존 서비스들은 주변 환경 설명이나 길 안내 중 한쪽만 제공합니다. SafeWalk는 두 가지를 하나의 앱에서, 별도 장비 없이 이미 가지고 있는 스마트폰만으로 해결하려 합니다.</p>
+        <h3 class="sr-heading" id="sources-heading">출처</h3>
+        <ul class="sources" aria-labelledby="sources-heading">
+          <li>등록장애인 현황 — 보건복지부, 「2024년 등록장애인 263만 1천 명, 전체 인구 대비 5.1%」(2025)</li>
+          <li>길 잃음 경험 — 장영건·차주현, 「시각장애인용 길안내 서비스 시스템에 대한 연구」, 『재활복지공학회논문지』 11(4), 2017</li>
+          <li>음향신호기 설치 실태 — 한국시각장애인연합회, 전국 시·도 및 시·군·구청 등 337개 대상시설 보행접근성 조사(2023)</li>
+        </ul>
+      </div>
+    </section>
+  </div>
+
+  <div class="band band--tint">
+    <section id="solution">
+      <div class="wrap">
+        <h2 data-reveal>무엇을 하는 앱인가요</h2>
+        <ul class="features">
+          <li data-reveal><h3>음성으로 목적지 입력</h3><p>화면을 보지 않고 말로 목적지를 정합니다.</p></li>
+          <li data-reveal><h3>보행 경로 음성 안내</h3><p>가야 할 방향과 남은 거리를 알려주고, 경로에서 벗어나면 바로 바로잡아 줍니다.</p></li>
+          <li data-reveal><h3>신호등 인식</h3><p>카메라로 보행 신호등을 찾아 색을 안내하고, 어느 방향으로 카메라를 들어야 하는지도 함께 알려줍니다.</p></li>
+        </ul>
+      </div>
+    </section>
+  </div>
+
+  <div class="band">
+    <section id="screens" data-reveal>
+      <div class="wrap">
+        <div class="shots-head">
+          <h2>앱 화면 미리보기</h2>
+          <button type="button" class="shots-toggle" data-shots-toggle aria-pressed="false">일시정지</button>
+        </div>
+        <p>목적지를 말하면 경로를 안내하고, 횡단보도에서는 신호등 색을 읽어 줍니다.</p>
+      </div>
+      <div class="marquee">
+        <div class="marquee__track" data-shots-track>
+          <figure><img src="images/01_voice.png" alt="‘목적지를 말하려면 화면을 두 번 누르세요’ 안내가 표시된 시작 화면" loading="lazy"><figcaption>① 목적지를 말로 입력</figcaption></figure>
+          <figure><img src="images/02_listening.png" alt="‘듣고 있어요… 태극당’ 음성 인식 중 화면" loading="lazy"><figcaption>② 음성 인식</figcaption></figure>
+          <figure><img src="images/03_select.png" alt="태극당 308미터, 태극당 장충본점 313미터 등 후보 장소를 고르는 화면" loading="lazy"><figcaption>③ 장소 선택</figcaption></figure>
+          <figure><img src="images/04_route.jpg" alt="‘목적지까지 약 300미터, 다음 횡단보도까지 약 100미터’ 지도와 경로 안내 화면" loading="lazy"><figcaption>④ 경로·거리 안내</figcaption></figure>
+          <figure><img src="images/05_signal.jpg" alt="카메라로 빨간불을 인식해 ‘빨간불 — 정지’를 안내하는 신호등 인식 화면" loading="lazy"><figcaption>⑤ 신호등 색 인식</figcaption></figure>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="band band--deep">
+    <section id="demo" data-reveal>
+      <div class="wrap">
+        <h2>실제로 어떻게 동작하나요</h2>
+        <div class="video">
+          <iframe src="https://www.youtube.com/embed/lw8KNV8uX44" title="SafeWalk 시연 영상"
+            referrerpolicy="strict-origin-when-cross-origin"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+        </div>
+        <p class="video-alt">영상이 보이지 않으면 <a href="https://youtu.be/lw8KNV8uX44">유튜브에서 시연 영상 보기</a></p>
+      </div>
+    </section>
+  </div>
+
+  <div class="band">
+    <section id="status" data-reveal>
+      <div class="wrap">
+        <h2>개발 현황</h2>
+        <p>현재 베타 버전으로 실제 시각장애인 사용자와 함께 테스트하고 있습니다. iOS 버전은 2026년 10월 출시를 준비하고 있습니다.</p>
+        <p>아래 버튼으로 베타 테스트에 참여하실 수 있습니다.</p>
+        <!-- TODO: 아래 href 를 실제 TestFlight 공개 링크로 교체 (예: https://testflight.apple.com/join/xxxxxxxx). Beta App Review 승인 후 공개. -->
+        <p><a class="cta" href="https://testflight.apple.com/join/XXXXXXXX">베타 신청하기 (TestFlight)</a></p>
+      </div>
+    </section>
+    <section id="notice" data-reveal>
+      <div class="wrap">
+        <div class="notice">
+          <h2>안전 고지</h2>
+          <p>SafeWalk는 보행을 돕는 <strong>보조 도구</strong>이며, 흰지팡이와 안내견을 대체하지 않습니다.</p>
+          <p>앱의 안내가 항상 정확하지는 않으며, 최종 판단은 언제나 사용자에게 있습니다.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="band band--tint">
+    <section id="team" data-reveal>
+      <div class="wrap">
+        <h2>만든 사람들</h2>
+        <ul class="team">
+          <li><span class="name">이도윤</span><span class="role">팀장, 프로젝트 총괄 및 유지보수</span></li>
+          <li><span class="name">김민성</span><span class="role">프로그램 개발 및 유지보수</span></li>
+          <li><span class="name">김수영</span><span class="role">프로그램 개발 및 인터뷰</span></li>
+          <li><span class="name">이지민</span><span class="role">iOS 앱 개발 · 홈페이지 관리</span></li>
+        </ul>
+      </div>
+    </section>
+    <section id="support" data-reveal>
+      <div class="wrap">
+        <div class="support">
+          <p>이 프로젝트는 <strong>서울미래인재재단 서울임팩트프로젝트</strong>에 선정되어 지원받고 있습니다.</p>
+        </div>
+      </div>
+    </section>
+    <section id="contact" data-reveal>
+      <div class="wrap">
+        <h2>함께 만들어가고 있습니다</h2>
+        <p>SafeWalk는 실제 시각장애인 사용자의 의견을 반영해 만들고 있습니다. 앱에 대한 의견을 들려주실 분, 베타 테스트 참여를 문의하실 분은 이메일로 연락 주세요.</p>
+        <a class="contact-mail" href="mailto:safewalkseoul@gmail.com">safewalkseoul@gmail.com</a>
+      </div>
+    </section>
+  </div>
+
+</main>
+
+<div class="divider divider--tint"><div class="crosswalk" data-reveal aria-hidden="true"></div></div>
+
+<footer class="band band--deep">
+  <div class="wrap">
+    <ul class="footer-links">
+      <li><a href="https://github.com/monggu03/SafeWalkNav">GitHub 저장소</a></li>
+      <li><a href="privacy.html">개인정보처리방침</a></li>
+      <li><a href="mailto:safewalkseoul@gmail.com">이메일 문의</a></li>
+    </ul>
+    <p>SafeWalk · 동국대학교 컴퓨터공학과 공개SW프로젝트</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var els = document.querySelectorAll("[data-reveal]");
+  function showAll() { for (var i = 0; i < els.length; i++) els[i].classList.add("is-visible"); }
+  if (!("IntersectionObserver" in window)) { showAll(); return; }
+  var io = new IntersectionObserver(function (entries) {
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].isIntersecting) { entries[i].target.classList.add("is-visible"); io.unobserve(entries[i].target); }
+    }
+  }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+  for (var i = 0; i < els.length; i++) io.observe(els[i]);
+  setTimeout(showAll, 3000);
+})();
+(function () {
+  var mq = document.querySelector(".marquee");
+  var btn = document.querySelector("[data-shots-toggle]");
+  if (!mq) return;
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var dir = 1, speed = 0.4, hoverPaused = false, userPaused = false;
+  function overflowing() { return (mq.scrollWidth - mq.clientWidth) > 2; }
+  function paused() { return hoverPaused || userPaused || reduce; }
+  // 움직임(스크롤)이 있을 때만 일시정지 버튼 노출
+  function updateToggle() { if (btn) btn.hidden = reduce || !overflowing(); }
+  function step() {
+    if (!paused() && overflowing()) {
+      var max = mq.scrollWidth - mq.clientWidth;
+      mq.scrollLeft += dir * speed;
+      if (mq.scrollLeft >= max) { dir = -1; }
+      else if (mq.scrollLeft <= 0) { dir = 1; }
+    }
+    requestAnimationFrame(step);
+  }
+  mq.addEventListener("mouseenter", function () { hoverPaused = true; });
+  mq.addEventListener("mouseleave", function () { hoverPaused = false; });
+  mq.addEventListener("focusin", function () { hoverPaused = true; });
+  mq.addEventListener("focusout", function () { hoverPaused = false; });
+  if (btn) {
+    btn.hidden = true;
+    btn.addEventListener("click", function () {
+      userPaused = !userPaused;
+      btn.setAttribute("aria-pressed", userPaused ? "true" : "false");
+      btn.textContent = userPaused ? "재생" : "일시정지";
+    });
+  }
+  window.addEventListener("resize", updateToggle);
+  window.addEventListener("load", updateToggle);
+  updateToggle();
+  requestAnimationFrame(step);
+})();
+</script>
+
+</body>
+</html>

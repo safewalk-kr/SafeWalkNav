@@ -1,8 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+fitsSystemWindows: targetSdk 35+ 에서는 edge-to-edge 가 강제돼 내용이 상태바·내비게이션 바
+밑으로 들어간다. 맨 아래 [동의] 버튼이 제스처 바에 가려지지 않도록 시스템 바만큼 안쪽으로 민다.
+
+큰 글꼴(저시력자 130~200%) 대응:
+ - 고지 문장은 스크롤 안에 둔다. 예전엔 고정 칸이라 글꼴을 키우면 문장 끝이 잘렸다.
+ - 버튼은 높이 고정 대신 최소 높이 + 내용에 맞춤 — 글자가 커지면 버튼도 커진다.
+
+버튼 순서 (2026-10): 위 [동의하지 않음](회색·작게), 맨 아래 [동의하고 시작하기](노랑·크게).
+화면 아래 가장자리를 손끝으로 더듬어 누르는 시각장애인이 맨 아래의 "동의하지 않음"을 눌러 막혔다.
+TalkBack 읽는 순서는 고지 → 동의 → 동의하지 않음(accessibilityTraversalBefore/After) —
+화면 배치와 달리 "동의"를 먼저 듣게 한다.
+-->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="#000000"
+    android:fitsSystemWindows="true">
 
     <!-- ========== 고지 화면 ========== -->
     <LinearLayout
@@ -10,43 +24,61 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:gravity="center"
         android:padding="24dp">
 
-        <TextView
-            android:id="@+id/tvNotice"
+        <ScrollView
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:gravity="center_vertical"
-            android:textSize="22sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:focusable="true"
-            android:text="SafeWalkNav는 보행을 돕는 보조 안내 시스템입니다. 실제 도로 상황과 다를 수 있으니, 흰지팡이와 주변 소리 등 평소의 판단을 함께 사용해 주세요. 안전한 이동의 최종 판단은 사용자 본인에게 있습니다." />
+            android:fillViewport="true">
 
+            <TextView
+                android:id="@+id/tvNotice"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:gravity="center_vertical"
+                android:textSize="22sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:focusable="true"
+                android:text="SafeWalk는 보행을 돕는 앱입니다. 안내가 실제와 다를 수 있으니 흰지팡이와 주변 소리로 꼭 함께 확인하세요. 최종 판단은 본인이 해야 합니다." />
+        </ScrollView>
+
+        <!--
+        [동의하지 않음] — 위, 회색, 작게. 바탕 #5A5A5A: 검정 화면 위에서도 버튼 테두리가 보이고
+        (예전 #333333 은 저시력자에게 바탕과 구별이 안 됐다) 흰 글씨 대비도 6:1 이상.
+        TalkBack 은 [동의] 다음에 읽는다.
+        -->
+        <Button
+            android:id="@+id/btnDecline"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="72dp"
+            android:layout_marginTop="16dp"
+            android:accessibilityTraversalAfter="@+id/btnAgree"
+            android:text="동의하지 않음"
+            android:textSize="20sp"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#5A5A5A" />
+
+        <!--
+        [동의하고 시작하기] — 맨 아래, 노랑, 크게(손끝이 먼저 닿는 곳).
+        contentDescription 을 따로 두지 않는다. 예전에는 "… 두 번 탭하면 앱을 시작합니다" 를 넣었는데,
+        TalkBack 이 자기 힌트("활성화하려면 두 번 탭하세요")를 또 붙여 같은 말을 두 번 들었다.
+        버튼 글씨가 곧 라벨이다.
+        -->
         <Button
             android:id="@+id/btnAgree"
             android:layout_width="match_parent"
-            android:layout_height="88dp"
+            android:layout_height="wrap_content"
+            android:minHeight="96dp"
             android:layout_marginTop="16dp"
+            android:accessibilityTraversalBefore="@id/btnDecline"
             android:text="동의하고 시작하기"
             android:textSize="24sp"
             android:textStyle="bold"
             android:textColor="#000000"
-            android:backgroundTint="#FFD700"
-            android:contentDescription="동의하고 시작하기. 두 번 탭하면 앱을 시작합니다." />
-
-        <Button
-            android:id="@+id/btnDecline"
-            android:layout_width="match_parent"
-            android:layout_height="72dp"
-            android:layout_marginTop="12dp"
-            android:text="동의하지 않음"
-            android:textSize="20sp"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="#333333"
-            android:contentDescription="동의하지 않음. 두 번 탭하면 종료 안내 화면으로 이동합니다." />
+            android:backgroundTint="#FFD700" />
     </LinearLayout>
 
     <!-- ========== 비동의 차단 화면 ========== -->
@@ -55,31 +87,36 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:gravity="center"
         android:padding="24dp"
         android:visibility="gone">
 
-        <TextView
-            android:id="@+id/tvBlocked"
+        <ScrollView
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:gravity="center"
-            android:textSize="24sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:focusable="true"
-            android:text="동의하지 않으셔서 앱을 사용하실 수 없습니다." />
+            android:fillViewport="true">
+
+            <TextView
+                android:id="@+id/tvBlocked"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:focusable="true"
+                android:text="동의하지 않으면 앱을 쓸 수 없습니다." />
+        </ScrollView>
 
         <Button
             android:id="@+id/btnReconsider"
             android:layout_width="match_parent"
-            android:layout_height="88dp"
-            android:text="다시 고지 보기"
+            android:layout_height="wrap_content"
+            android:minHeight="88dp"
+            android:text="안내 다시 듣기"
             android:textSize="24sp"
             android:textStyle="bold"
             android:textColor="#000000"
-            android:backgroundTint="#FFD700"
-            android:contentDescription="다시 고지 보기. 두 번 탭하면 안내 고지 화면으로 돌아갑니다." />
+            android:backgroundTint="#FFD700" />
     </LinearLayout>
 </FrameLayout>
